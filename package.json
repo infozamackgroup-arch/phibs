@@ -1,0 +1,10 @@
+{
+  "name": "phibs-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Phibs Luxury Homes website with admin area, bookings and receipts",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "inspect-old-db": "node scripts/inspect-old-db.js" },
+  "engines": { "node": ">=22.5" },
+  "dependencies": { "pg": "^8.13.0" }
+}
