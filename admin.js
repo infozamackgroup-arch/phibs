@@ -4,7 +4,7 @@
   var esc = function (t) { return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); };
   var naira = function (n) { return '₦' + Number(n || 0).toLocaleString('en-NG'); };
   var num = function (v) { var n = Number(String(v == null ? '' : v).replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : 0; };
-  var STATUS = { awaiting_payment: 'Awaiting payment', confirmed: 'Confirmed', checked_in: 'Checked in', completed: 'Completed', cancelled: 'Cancelled' };
+  var STATUS = { awaiting_payment: 'Awaiting payment', confirmed: 'Reserved', checked_in: 'Checked in', completed: 'Completed', cancelled: 'Cancelled' };
   var pill = function (s) { return '<span class="pill p-' + esc(s) + '">' + esc(STATUS[s] || s) + '</span>'; };
   var fdate = function (s) { if (!s) return '-'; var d = new Date(s + 'T00:00:00'); return isNaN(d) ? esc(s) : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); };
 
@@ -14,7 +14,7 @@
     return fetch('/api/admin' + path, o).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (j) {
         if (r.status === 401 && path !== '/login') { loginView(); throw new Error('Please log in again.'); }
-        if (!r.ok) throw new Error(j.error || 'Something went wrong.'); return j;
+        if (!r.ok) { var er = new Error(j.error || 'Something went wrong.'); er.clash = !!j.clash; throw er; } return j;
       });
     });
   }
@@ -47,23 +47,25 @@
 
   /* ---------- login ---------- */
   function loginView() {
-    $('#app').innerHTML = '<div class="login"><img src="phibs-logo.png" alt="Phibs Luxury Homes"><div class="card"><h2>Admin login</h2><p class="muted">Phibs Luxury Homes website and bookings.</p><form id="lf"><div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password" required></div><div class="err" id="le"></div><button class="btn" style="width:100%">Log in</button></form></div></div>';
-    $('#lf').onsubmit = function (e) { e.preventDefault(); api('/login', { password: $('#pw').value }).then(start).catch(function (er) { $('#le').textContent = er.message; }); };
+    $('#app').innerHTML = '<div class="login"><img src="phibs-logo.png" alt="Phibs Luxury Homes"><div class="card"><h2>Log in</h2><p class="muted">Phibs Luxury Homes website and bookings.</p><form id="lf"><div class="field"><label>Username</label><input id="un" autocomplete="username" autocapitalize="none" placeholder="admin" spellcheck="false"><p class="muted" style="margin:4px 0 0">Owner: leave empty or type admin. Staff: use the username you were given.</p></div><div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password" required></div><div class="err" id="le"></div><button class="btn" style="width:100%">Log in</button></form></div></div>';
+    $('#lf').onsubmit = function (e) { e.preventDefault(); api('/login', { username: $('#un').value, password: $('#pw').value }).then(function () { return api('/me'); }).then(function (d) { ME = { role: d.role, name: d.name }; start(); }).catch(function (er) { $('#le').textContent = er.message; }); };
   }
 
   /* ---------- shell ---------- */
-  var TABS = [['dash', 'Dashboard'], ['bookings', 'Bookings'], ['apartments', 'Apartments'], ['site', 'Website text'], ['gallery', 'Gallery'], ['enquiries', 'Enquiries'], ['old', 'Old records'], ['account', 'Account']];
+  var ME = { role: 'admin', name: 'Admin' };
+  var ALL_TABS = [['dash', 'Dashboard'], ['bookings', 'Bookings'], ['reservations', 'Reservations'], ['apartments', 'Apartments'], ['site', 'Website text'], ['gallery', 'Gallery'], ['enquiries', 'Enquiries'], ['staff', 'Staff'], ['old', 'Old records'], ['account', 'Account']];
+  var tabs = function () { return ME.role === 'admin' ? ALL_TABS : ALL_TABS.filter(function (t) { return ['dash', 'bookings', 'reservations', 'enquiries'].indexOf(t[0]) >= 0; }); };
   function shell(active) {
-    $('#app').innerHTML = '<header><div class="bar"><img src="phibs-logo.png" alt=""><b>Admin</b><a class="btn ghost sm" href="/" target="_blank" rel="noopener" style="color:#fff;background:transparent;border-color:rgba(255,255,255,.4)">View website</a><button id="lo">Log out</button></div><nav><div>' +
-      TABS.map(function (t) { return '<a href="#/' + t[0] + '" class="' + (t[0] === active ? 'on' : '') + '">' + t[1] + '</a>'; }).join('') + '</div></nav></header><main id="main"></main>';
+    $('#app').innerHTML = '<header><div class="bar"><img src="phibs-logo.png" alt=""><b>' + (ME.role === 'admin' ? 'Admin' : esc(ME.name) + ' <span style="font-weight:400;font-size:13px;opacity:.8">(staff)</span>') + '</b><a class="btn ghost sm" href="/" target="_blank" rel="noopener" style="color:#fff;background:transparent;border-color:rgba(255,255,255,.4)">View website</a><button id="lo">Log out</button></div><nav><div>' +
+      tabs().map(function (t) { return '<a href="#/' + t[0] + '" class="' + (t[0] === active ? 'on' : '') + '">' + t[1] + '</a>'; }).join('') + '</div></nav></header><main id="main"></main>';
     $('#lo').onclick = function () { api('/logout', {}).then(loginView); };
     return $('#main');
   }
   function render() {
-    var name = (location.hash.replace('#/', '') || 'dash').split('/')[0]; if (!VIEWS[name]) name = 'dash';
-    var el = shell(name); VIEWS[name](el);
+    var name = (location.hash.replace('#/', '') || 'dash').split('/')[0]; if (!VIEWS[name] || !tabs().some(function (t) { return t[0] === name; })) name = 'dash';
+    CUR = name; var el = shell(name); VIEWS[name](el);
   }
-  var VIEWS = {};
+  var VIEWS = {}, CUR = 'dash';
 
   /* ---------- dashboard ---------- */
   VIEWS.dash = function (el) {
@@ -71,7 +73,7 @@
       var row = function (b) { return '<tr class="click" data-ref="' + esc(b.ref) + '"><td><b>' + esc(b.name) + '</b><div class="muted">' + esc(b.room) + '</div></td><td>' + fdate(b.checkin) + ' to ' + fdate(b.checkout) + '</td><td>' + pill(b.status) + '</td></tr>'; };
       el.innerHTML = '<div class="head"><h1>Dashboard</h1></div>' +
         (d.persistent ? '' : '<div class="alert bad"><b>Your data is NOT being saved permanently.</b> Everything entered will be erased on the next update. In Render add a Disk with mount path <b>/var/data</b> and set <b>DATA_DIR</b> to <b>/var/data</b>.</div>') +
-        '<div class="grid g4"><div class="stat"><small>Awaiting payment</small><b>' + d.awaiting + '</b></div><div class="stat"><small>Confirmed</small><b>' + d.confirmed + '</b></div><div class="stat"><small>Enquiries received</small><b>' + d.enquiries + '</b></div><div class="stat"><small>Payments recorded</small><b>' + naira(d.collected) + '</b></div></div><div style="height:16px"></div>' +
+        '<div class="grid g4"><div class="stat"><small>Awaiting payment</small><b>' + d.awaiting + '</b></div><div class="stat"><small>Reserved</small><b>' + d.confirmed + '</b></div><div class="stat"><small>Enquiries received</small><b>' + d.enquiries + '</b></div>' + (d.collected == null ? '' : '<div class="stat"><small>Payments recorded</small><b>' + naira(d.collected) + '</b></div>') + '</div><div style="height:16px"></div>' +
         '<div class="grid g2"><div class="card scroll"><h3>Staying now</h3><table><tbody>' + (d.inHouse.length ? d.inHouse.map(row).join('') : '<tr><td class="muted">Nobody checked in right now.</td></tr>') + '</tbody></table></div>' +
         '<div class="card scroll"><h3>Coming up</h3><table><tbody>' + (d.upcoming.length ? d.upcoming.map(row).join('') : '<tr><td class="muted">No upcoming bookings.</td></tr>') + '</tbody></table></div></div>' +
         (d.legacy.length ? '<div class="card"><h3>Old system records</h3><p class="muted">' + d.legacy.map(function (t) { return esc(t.name) + ' (' + t.row_count + ')'; }).join(', ') + '. <a href="#/old">Open</a></p></div>' : '');
@@ -105,17 +107,97 @@
       '<form id="bf"><div class="grid g2"><div class="field"><label>Guest name</label><input name="name" value="' + esc(b.name) + '" required></div><div class="field"><label>Phone</label><input name="phone" value="' + esc(b.phone) + '"></div></div>' +
       '<div class="grid g2"><div class="field"><label>Email</label><input name="email" value="' + esc(b.email) + '"></div><div class="field"><label>Apartment</label><select name="room">' + (BK.rooms.indexOf(b.room) < 0 && b.room ? '<option>' + esc(b.room) + '</option>' : '') + BK.rooms.map(function (r) { return '<option' + (r === b.room ? ' selected' : '') + '>' + esc(r) + '</option>'; }).join('') + '</select></div></div>' +
       '<div class="grid g3"><div class="field"><label>Check-in</label><input type="date" name="checkin" value="' + esc(b.checkin) + '" required></div><div class="field"><label>Check-out</label><input type="date" name="checkout" value="' + esc(b.checkout) + '" required></div><div class="field"><label>Guests</label><input name="guests" inputmode="numeric" value="' + esc(b.guests) + '"></div></div>' +
-      '<div class="grid g3"><div class="field"><label>Stay total (₦)</label><input name="subtotal" inputmode="numeric" value="' + esc(b.subtotal) + '" placeholder="Auto from rate"></div><div class="field"><label>Caution fee (₦)</label><input name="caution" inputmode="numeric" value="' + esc(b.caution) + '"></div><div class="field"><label>Amount paid so far (₦)</label><input name="paid" inputmode="numeric" value="' + esc(b.paid) + '"></div></div>' +
+      '<div class="grid g3"><div class="field"><label>Stay total (₦)</label><input name="subtotal" inputmode="numeric" value="' + esc(b.subtotal) + '" placeholder="Auto from rate"></div><div class="field"><label>Caution fee (₦)</label><input name="caution" inputmode="numeric" value="' + esc(b.caution) + '"></div>' + (isNew ? '<div class="field"><label>Amount paid now (₦)</label><input name="paid" inputmode="numeric" value="0"></div>' : '<div class="field"><label>Paid so far</label><input value="' + naira(b.paid) + '" disabled></div>') + '</div>' +
       '<div class="grid g2"><div class="field"><label>Status</label><select name="status">' + Object.keys(STATUS).map(function (s) { return '<option value="' + s + '"' + (b.status === s ? ' selected' : '') + '>' + STATUS[s] + '</option>'; }).join('') + '</select></div><div class="field"><label>Private notes</label><input name="notes" value="' + esc(b.notes) + '" placeholder="Only visible here"></div></div>' +
       '<div class="err" id="be"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn">' + (isNew ? 'Save booking' : 'Save changes') + '</button>' +
-      (isNew ? '' : (b.phone ? '<a class="btn ghost" target="_blank" rel="noopener" href="https://wa.me/' + esc(String(b.phone).replace(/[^0-9]/g, '').replace(/^0/, '234')) + '">WhatsApp guest</a>' : '') + '<button type="button" class="btn red" id="del" style="margin-left:auto">Delete</button>') + '</div></form>');
+      (isNew ? '' : (b.phone ? '<a class="btn ghost" target="_blank" rel="noopener" href="https://wa.me/' + esc(String(b.phone).replace(/[^0-9]/g, '').replace(/^0/, '234')) + '">WhatsApp guest</a>' : '') + (ME.role === 'admin' ? '<button type="button" class="btn red" id="del" style="margin-left:auto">Delete</button>' : '')) + '</div></form>' + (isNew ? '' : '<div id="paybox" class="card" style="margin:18px 0 0;background:#faf8f3"><p class="muted">Loading payments...</p></div>'));
     $('#bf', m).onsubmit = function (e) {
       e.preventDefault(); var f = {}; $$('[name]', m).forEach(function (i) { f[i.name] = i.value; });
       if (!isNew) { f.rate = b.rate; if (String(f.subtotal) === String(b.subtotal) && (f.checkin !== b.checkin || f.checkout !== b.checkout)) f.subtotal = ''; }
-      api(isNew ? '/bookings' : '/bookings/' + b.id, f).then(function () { m.close(); toast('Saved'); VIEWS.bookings(el); }).catch(function (er) { $('#be', m).textContent = er.message; });
+      var send = function (extra) { return api(isNew ? '/bookings' : '/bookings/' + b.id, Object.assign({}, f, extra || {})); };
+      send().catch(function (er) { if (er.clash && ME.role === 'admin' && confirm(er.message + '\n\nSave it anyway?')) return send({ force: true }); throw er; })
+        .then(function (res) {
+          var becameReserved = f.status === 'confirmed' && (isNew || b.status !== 'confirmed'), id = isNew ? null : b.id, ref = res && res.ref;
+          m.close(); toast(becameReserved ? 'Saved. This booking is now a reservation.' : 'Saved'); (CUR === 'reservations' ? VIEWS.reservations : VIEWS.bookings)(el);
+          if (becameReserved) api('/bookings').then(function (d) { var nb = d.bookings.filter(function (x) { return id ? x.id === id : x.ref === ref; })[0]; if (!nb) return;
+            if (nb.paid > 0) return api('/bookings/' + nb.id + '/payments').then(showReceipt);
+            toast('Reserved. Record the payment to issue the receipt.', true); bookingModal(nb, el); }).catch(fail);
+        }).catch(function (er) { $('#be', m).textContent = er.message; });
     };
-    if (!isNew) $('#del', m).onclick = function () { if (confirm('Delete booking ' + b.ref + ' permanently?')) api('/bookings/' + b.id + '/delete', {}).then(function () { m.close(); VIEWS.bookings(el); }).catch(fail); };
+    if (!isNew) loadPay(b, m, el);
+    if (!isNew && $('#del', m)) $('#del', m).onclick = function () { if (confirm('Delete booking ' + b.ref + ' permanently?')) api('/bookings/' + b.id + '/delete', {}).then(function () { m.close(); VIEWS.bookings(el); }).catch(fail); };
   }
+
+  /* ---------- reservations ---------- */
+  VIEWS.reservations = function (el) {
+    api('/bookings').then(function (d) {
+      BK.list = d.bookings; BK.rooms = d.rooms;
+      var rows = BK.list.filter(function (b) { return b.status === 'confirmed'; }).sort(function (x, y) { return x.checkin < y.checkin ? -1 : x.checkin > y.checkin ? 1 : 0; });
+      el.innerHTML = '<div class="head"><h1>Reservations</h1></div><p class="muted" style="margin-top:-6px">Confirmed bookings waiting for check-in. A payment receipt is issued as soon as a booking becomes a reservation.</p>' +
+        '<div class="card scroll"><table><thead><tr><th>Reference</th><th>Guest</th><th>Apartment</th><th>Stay</th><th class="num">Paid</th><th class="num">Balance</th><th></th></tr></thead><tbody>' +
+        (rows.length ? rows.map(function (b) { var bal = Math.max(0, b.subtotal + b.caution - b.paid); return '<tr class="click" data-id="' + b.id + '"><td>' + esc(b.ref) + '</td><td><b>' + esc(b.name) + '</b><div class="muted">' + esc(b.phone) + '</div></td><td>' + esc(b.room) + '</td><td>' + fdate(b.checkin) + ' to ' + fdate(b.checkout) + '<div class="muted">' + b.nights + ' night' + (b.nights === 1 ? '' : 's') + '</div></td><td class="num">' + naira(b.paid) + '</td><td class="num">' + (bal ? '<b style="color:var(--red)">' + naira(bal) + '</b>' : 'Paid') + '</td><td class="num"><button class="btn ghost sm" data-rc="' + b.id + '">Receipt</button> <button class="btn sm" data-ci="' + b.id + '">Check in</button></td></tr>'; }).join('') : '<tr><td colspan="7" class="muted">No reservations yet. A booking appears here once it is confirmed.</td></tr>') + '</tbody></table></div>';
+      $$('tr.click', el).forEach(function (tr) { tr.onclick = function () { bookingModal(BK.list.filter(function (b) { return b.id === Number(tr.getAttribute('data-id')); })[0], el); }; });
+      $$('[data-rc]', el).forEach(function (x) { x.onclick = function (e) { e.stopPropagation(); api('/bookings/' + x.getAttribute('data-rc') + '/payments').then(showReceipt).catch(fail); }; });
+      $$('[data-ci]', el).forEach(function (x) { x.onclick = function (e) { e.stopPropagation(); if (confirm('Check this guest in now?')) api('/bookings/' + x.getAttribute('data-ci'), { status: 'checked_in' }).then(function () { toast('Checked in'); VIEWS.reservations(el); }).catch(fail); }; });
+    }).catch(fail);
+  };
+
+  /* ---------- payments and receipt ---------- */
+  var fdt = function (s) { if (!s) return ''; var d = new Date(String(s).replace(' ', 'T')); return isNaN(d) ? esc(s) : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) + ', ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }); };
+  function loadPay(b, m, el) {
+    api('/bookings/' + b.id + '/payments').then(function (d) { drawPay(d, m, el); }).catch(function (e) { $('#paybox', m).innerHTML = '<p class="err">' + esc(e.message) + '</p>'; });
+  }
+  function drawPay(d, m, el) {
+    var bk = d.booking, due = bk.subtotal + bk.caution, bal = Math.max(0, due - bk.paid), box = $('#paybox', m); if (!box) return;
+    box.innerHTML = '<h3 style="margin-bottom:10px">Payments</h3>' +
+      '<div class="scroll"><table><thead><tr><th>Date</th><th>Method</th><th class="num">Amount</th><th>Received by</th><th></th></tr></thead><tbody>' +
+      (d.carried > 0 ? '<tr><td colspan="2">Earlier payment (old system)</td><td class="num">' + naira(d.carried) + '</td><td></td><td></td></tr>' : '') +
+      (d.payments.length ? d.payments.map(function (p) { return '<tr><td>' + fdt(p.created_at) + (p.note ? '<div class="muted">' + esc(p.note) + '</div>' : '') + '</td><td>' + esc(p.method) + '</td><td class="num">' + naira(p.amount) + '</td><td>' + esc(p.by_name) + '</td><td>' + (ME.role === 'admin' ? '<button type="button" class="btn ghost sm" data-dp="' + p.id + '">Remove</button>' : '') + '</td></tr>'; }).join('') : (d.carried > 0 ? '' : '<tr><td colspan="5" class="muted">No payment recorded yet.</td></tr>')) +
+      '</tbody></table></div>' +
+      '<p style="margin:12px 0"><b>Total due ' + naira(due) + '</b> (stay ' + naira(bk.subtotal) + ' + refundable caution ' + naira(bk.caution) + ') &middot; <b>Paid ' + naira(bk.paid) + '</b> &middot; <b style="color:' + (bal ? 'var(--red)' : 'var(--ok)') + '">' + (bal ? 'Balance ' + naira(bal) : 'Fully paid') + '</b></p>' +
+      '<form id="pf2"><div class="grid g3"><div class="field"><label>Amount received (₦)</label><input name="amount" inputmode="numeric" required placeholder="' + (bal ? bal : '') + '"></div><div class="field"><label>Paid by</label><select name="method"><option>Transfer</option><option>Cash</option><option>POS</option><option>Other</option></select></div><div class="field"><label>Note (optional)</label><input name="note" placeholder="e.g. deposit"></div></div>' +
+      '<div class="err" id="pe2"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn gold">Record payment and issue receipt</button>' + (bk.paid > 0 ? '<button type="button" class="btn ghost" id="rp">Print receipt</button>' : '') + '</div></form>';
+    $('#pf2', m).onsubmit = function (e) {
+      e.preventDefault(); var f = {}; $$('[name]', $('#pf2', m)).forEach(function (i) { f[i.name] = i.value; });
+      api('/bookings/' + bk.id + '/payments', f).then(function (nd) { toast(bk.status !== 'confirmed' && nd.booking.status === 'confirmed' ? 'Payment recorded. Booking is now a reservation.' : 'Payment recorded'); drawPay(nd, m, el); showReceipt(nd); refreshList(el); }).catch(function (er) { $('#pe2', m).textContent = er.message; });
+    };
+    if ($('#rp', m)) $('#rp', m).onclick = function () { showReceipt(d); };
+    $$('[data-dp]', m).forEach(function (x) { x.onclick = function () { if (confirm('Remove this payment record? The balance will go back up.')) api('/payments/' + x.getAttribute('data-dp') + '/delete', {}).then(function (nd) { drawPay(nd, m, el); refreshList(el); }).catch(fail); }; });
+  }
+  function refreshList(el) { api('/bookings').then(function (d) { BK.list = d.bookings; if ($('#q')) drawBookings(el); }).catch(function () {}); }
+  function showReceipt(d) {
+    var bk = d.booking, S = d.site, due = bk.subtotal + bk.caution, bal = Math.max(0, due - bk.paid), old = $('#rcpt'); if (old) old.remove();
+    var last = d.payments.length ? d.payments[d.payments.length - 1] : null, issued = last ? fdt(last.created_at) : fdt(new Date().toISOString().slice(0, 19));
+    var row = function (k, v) { return '<tr><td>' + k + '</td><td class="r">' + v + '</td></tr>'; };
+    var pays = (d.carried > 0 ? '<tr><td>Earlier payment</td><td>-</td><td class="r">' + naira(d.carried) + '</td></tr>' : '') + d.payments.map(function (p) { return '<tr><td>' + fdt(p.created_at) + '</td><td>' + esc(p.method) + (p.note ? ' (' + esc(p.note) + ')' : '') + '</td><td class="r">' + naira(p.amount) + '</td></tr>'; }).join('');
+    var el = document.createElement('div'); el.id = 'rcpt';
+    el.innerHTML = '<div class="rc-bar"><button class="btn" id="rcPrint">Print receipt</button><button class="btn ghost" id="rcClose">Close</button></div>' +
+      '<div class="rc-paper"><div class="rc-head"><img src="phibs-logo.png" alt="Phibs Luxury Homes"><div class="rc-co"><b>Phibs Luxury Homes</b><br>' + esc(S.city || 'Abuja') + ', Nigeria &middot; ' + esc(S.rc || '') + '<br>' + esc(S.phone1 || '') + (S.phone2 ? ' / ' + esc(S.phone2) : '') + '<br>' + esc(S.email || '') + '</div></div>' +
+      '<h1>Payment receipt</h1><table class="rc-meta"><tr><td>Receipt no.</td><td class="r"><b>' + esc(bk.ref) + '</b></td></tr><tr><td>Date issued</td><td class="r">' + issued + '</td></tr></table>' +
+      '<h4>Guest and stay</h4><table class="rc-t">' + row('Guest', esc(bk.name)) + (bk.phone ? row('Phone', esc(bk.phone)) : '') + row('Apartment', esc(bk.room)) + row('Check-in', fdate(bk.checkin)) + row('Check-out', fdate(bk.checkout)) + row('Nights', bk.nights) + row('Rate per night', naira(bk.rate)) + '</table>' +
+      '<h4>Payments received</h4><table class="rc-t rc-p"><thead><tr><th>Date</th><th>Method</th><th class="r">Amount</th></tr></thead><tbody>' + (pays || '<tr><td colspan="3">No payment yet</td></tr>') + '</tbody></table>' +
+      '<table class="rc-t rc-sum">' + row('Stay total', naira(bk.subtotal)) + row('Refundable caution fee', naira(bk.caution)) + row('Total due', naira(due)) + row('Total paid', '<b>' + naira(bk.paid) + '</b>') + row('Balance', '<b>' + naira(bal) + '</b>') + '</table>' +
+      '<div class="rc-stamp ' + (bal ? 'part' : 'full') + '">' + (bal ? 'PART PAYMENT' : 'PAID IN FULL') + '</div>' +
+      '<p class="rc-foot">' + (last ? 'Received by ' + esc(last.by_name) + '. ' : '') + 'The caution fee is refundable after checkout, subject to our booking policy. Thank you for choosing Phibs Luxury Homes.</p></div>';
+    document.body.appendChild(el); document.body.classList.add('printing');
+    var close = function () { el.remove(); document.body.classList.remove('printing'); };
+    $('#rcClose', el).onclick = close; $('#rcPrint', el).onclick = function () { window.print(); };
+  }
+
+  /* ---------- staff ---------- */
+  VIEWS.staff = function (el) {
+    api('/staff').then(function (d) {
+      el.innerHTML = '<div class="head"><h1>Staff</h1><button class="btn gold" id="add">+ Add staff</button></div><p class="muted" style="margin-top:-6px">Staff can take bookings, record payments and print receipts. They cannot change the website, prices, apartments or other staff, and they cannot delete bookings.</p>' +
+        '<div class="card scroll"><table><thead><tr><th>Name</th><th>Username</th><th>Added</th><th></th></tr></thead><tbody>' +
+        (d.staff.length ? d.staff.map(function (s) { return '<tr><td><b>' + esc(s.name) + '</b></td><td>' + esc(s.username) + '</td><td>' + esc((s.created_at || '').slice(0, 10)) + '</td><td class="num"><button class="btn ghost sm" data-pw="' + s.id + '">Reset password</button> <button class="btn red sm" data-rm="' + s.id + '" data-n="' + esc(s.name) + '">Delete</button></td></tr>'; }).join('') : '<tr><td colspan="4" class="muted">No staff yet. Add the first one.</td></tr>') + '</tbody></table></div>';
+      $('#add').onclick = function () {
+        var m = modal('<h2>Add staff</h2><form id="sf2"><div class="field"><label>Full name</label><input name="name" required></div><div class="grid g2"><div class="field"><label>Username (for logging in)</label><input name="username" autocapitalize="none" required placeholder="e.g. chioma"></div><div class="field"><label>Password (8+ characters)</label><input name="password" type="text" autocomplete="off" required></div></div><p class="muted">Give them the website address /admin, their username and this password.</p><div class="err" id="se2"></div><button class="btn">Add staff</button></form>');
+        $('#sf2', m).onsubmit = function (e) { e.preventDefault(); var f = {}; $$('[name]', m).forEach(function (i) { f[i.name] = i.value; }); api('/staff', f).then(function () { m.close(); toast('Staff added'); VIEWS.staff(el); }).catch(function (er) { $('#se2', m).textContent = er.message; }); };
+      };
+      $$('[data-pw]', el).forEach(function (b) { b.onclick = function () { var p = prompt('New password for this staff member (8+ characters):'); if (p) api('/staff/' + b.getAttribute('data-pw') + '/password', { password: p }).then(function () { toast('Password changed'); }).catch(fail); }; });
+      $$('[data-rm]', el).forEach(function (b) { b.onclick = function () { if (confirm('Delete ' + b.getAttribute('data-n') + '? They will not be able to log in again. Bookings they made are kept.')) api('/staff/' + b.getAttribute('data-rm') + '/delete', {}).then(function () { toast('Staff deleted'); VIEWS.staff(el); }).catch(fail); }; });
+    }).catch(fail);
+  };
 
   /* ---------- apartments ---------- */
   VIEWS.apartments = function (el) {
@@ -132,6 +214,7 @@
     var photos = a.photos.slice(), m = modal('<h2>' + (isNew ? 'Add apartment' : 'Edit ' + esc(a.name)) + '</h2><form id="af"><div class="grid g2"><div class="field"><label>Name</label><input name="name" value="' + esc(a.name) + '" required></div><div class="field"><label>Short tag (shown on the photo)</label><input name="tagline" value="' + esc(a.tagline) + '" placeholder="e.g. Premium stay"></div></div>' +
       '<div class="field"><label>Description</label><textarea name="description">' + esc(a.description) + '</textarea></div>' +
       '<div class="grid g3"><div class="field"><label>Price per night (₦)</label><input name="rate" inputmode="numeric" value="' + esc(a.rate) + '" required></div><div class="field"><label>Sleeps (guests)</label><input name="capacity" inputmode="numeric" value="' + esc(a.capacity) + '"></div><div class="field"><label>Show on website</label><select name="active"><option value="1"' + (a.active ? ' selected' : '') + '>Yes</option><option value="0"' + (a.active ? '' : ' selected') + '>No (hidden)</option></select></div></div>' +
+      '<div class="field"><label>How many of this apartment do you have?</label><input name="units" inputmode="numeric" value="' + esc(a.units || 1) + '"><p class="muted" style="margin:4px 0 0">Normally 1. Guests can book it until every unit is taken for their dates.</p></div>' +
       '<div class="field"><label>Amenities (separate with commas)</label><input name="amenities" value="' + esc(a.amenities.join(', ')) + '"></div>' +
       '<div class="field"><label>Photos (the first one is the cover)</label><div class="photos" id="ph"></div><p><button type="button" class="btn ghost sm" id="up">+ Add photos</button> <span class="muted" id="upn"></span></p></div>' +
       '<div class="err" id="ae"></div><div style="display:flex;gap:10px"><button class="btn">' + (isNew ? 'Add apartment' : 'Save changes') + '</button>' + (isNew ? '' : '<button type="button" class="btn red" id="del" style="margin-left:auto">Delete</button>') + '</div></form>');
@@ -226,5 +309,5 @@
 
   function start() { render(); }
   window.addEventListener('hashchange', function () { if ($('#main')) render(); });
-  api('/me').then(function (d) { if (d.admin) start(); else loginView(); }).catch(loginView);
+  api('/me').then(function (d) { if (d.in) { ME = { role: d.role, name: d.name }; start(); } else loginView(); }).catch(loginView);
 })();
