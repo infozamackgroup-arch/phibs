@@ -35,6 +35,8 @@ CREATE INDEX IF NOT EXISTS pay_bk ON payments(booking_id);
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT DEFAULT (datetime('now')), action TEXT, detail TEXT);
 `);
 try { db.exec('ALTER TABLE apartments ADD COLUMN units INTEGER DEFAULT 1'); } catch {}
+try { db.exec('ALTER TABLE apartments ADD COLUMN caution INTEGER'); } catch {}
+try { db.exec("ALTER TABLE payments ADD COLUMN by_user TEXT DEFAULT ''"); } catch {}
 const run = (sql, ...a) => db.prepare(sql).run(...a);
 const get = (sql, ...a) => db.prepare(sql).get(...a);
 const all = (sql, ...a) => db.prepare(sql).all(...a);
@@ -73,7 +75,7 @@ if (!get("SELECT 1 FROM settings WHERE key='seeded'")) {
 }
 const getSite = () => { const o = { ...DEFAULT_SITE }; for (const r of all('SELECT key,value FROM settings')) if (r.key in DEFAULT_SITE) { try { o[r.key] = JSON.parse(r.value); } catch {} } return o; };
 const setSetting = (k, v) => run('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)', k, JSON.stringify(v));
-const aptOut = a => ({ id: a.id, name: a.name, tagline: a.tagline, description: a.description, rate: a.rate, capacity: a.capacity, amenities: JSON.parse(a.amenities || '[]'), photos: JSON.parse(a.photos || '[]'), active: !!a.active, sort: a.sort, units: a.units || 1 });
+const aptOut = a => ({ id: a.id, name: a.name, tagline: a.tagline, description: a.description, rate: a.rate, capacity: a.capacity, amenities: JSON.parse(a.amenities || '[]'), photos: JSON.parse(a.photos || '[]'), active: !!a.active, sort: a.sort, units: a.units || 1, caution: a.caution == null ? null : a.caution, caution_fee: a.caution == null ? getSite().caution_fee : a.caution });
 
 /* ---------- security helpers ---------- */
 const keyFile = path.join(DATA_DIR, 'secret.key');
@@ -92,8 +94,9 @@ const verify = (t) => { try { const [b, s] = String(t).split('.'); const ok = cr
 const adminVer = () => sha(JSON.parse(get("SELECT value FROM settings WHERE key='admin_hash'").value)).slice(0, 12);
 const cookieOf = (req) => { const m = /(?:^|;\s*)sid=([^;]+)/.exec(req.headers.cookie || ''); return m ? m[1] : ''; };
 const who = (req) => { const p = verify(cookieOf(req)); if (!p) return null;
-  if (p.role === 'staff') { const st = get('SELECT * FROM staff WHERE id=?', Number(p.id)); return st && p.v === sha(st.hash).slice(0, 12) ? { role: 'staff', id: st.id, name: st.name } : null; }
-  return p.v === adminVer() ? { role: 'admin', name: 'Admin' } : null; };
+  if (p.role === 'staff') { const st = get('SELECT * FROM staff WHERE id=?', Number(p.id)); return st && p.v === sha(st.hash).slice(0, 12) ? { role: 'staff', id: st.id, name: st.name, username: st.username } : null; }
+  return p.v === adminVer() ? { role: 'admin', name: 'Admin', username: 'admin' } : null; };
+const priv = (w, b) => w.role === 'admin' ? b : { ...b, phone: '', email: '' };
 const isAdmin = (req) => { const w = who(req); return !!w && w.role === 'admin'; };
 const buckets = new Map();
 const limit = (key, max, windowMs) => { const now = Date.now(); const b = (buckets.get(key) || []).filter(t => now - t < windowMs); if (b.length >= max) { buckets.set(key, b); return false; } b.push(now); buckets.set(key, b); return true; };
@@ -150,12 +153,12 @@ route('POST', /^\/api\/bookings$/, false, ({ req, res, body }) => {
   if (ci < lagosToday()) throw new HttpError(400, 'Check-in cannot be in the past.');
   if (!isFree(apt, ci, co)) throw new HttpError(409, apt.name + ' is not available for those dates. Please choose different dates or another apartment.');
   const guests = Math.min(Math.max(int(body.guests, 1), 1), apt.capacity), nights = daysBetween(ci, co), subtotal = nights * apt.rate;
-  const deposit = Math.round(subtotal * site.deposit_pct / 100);
+  const caution = apt.caution == null ? site.caution_fee : apt.caution, deposit = Math.round(subtotal * site.deposit_pct / 100);
   const ref = newRef();
   run('INSERT INTO bookings(ref,name,email,phone,room,checkin,checkout,guests,nights,rate,subtotal,caution,deposit,message) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-    ref, name, email, phone, apt.name, ci, co, guests, nights, apt.rate, subtotal, site.caution_fee, deposit, str(body.message, 1000));
+    ref, name, email, phone, apt.name, ci, co, guests, nights, apt.rate, subtotal, caution, deposit, str(body.message, 1000));
   audit('booking.new', ref + ' ' + apt.name);
-  J(res, 200, { ref, nights, rate: apt.rate, subtotal, deposit, caution: site.caution_fee, guests });
+  J(res, 200, { ref, nights, rate: apt.rate, subtotal, deposit, caution, guests });
 });
 route('POST', /^\/api\/enquiries$/, false, ({ req, res, body }) => {
   if (!limit('eq|' + ipOf(req), 20, 3600e3)) throw new HttpError(429, 'Too many requests.');
@@ -226,21 +229,21 @@ route('POST', /^\/api\/admin\/upload$/, 'admin', ({ res, body }) => {
 const aptFields = (b) => ({
   name: str(b.name, 120), tagline: str(b.tagline, 120), description: str(b.description, 600), rate: Math.max(0, int(b.rate)), capacity: Math.min(20, Math.max(1, int(b.capacity, 2))),
   amenities: JSON.stringify((Array.isArray(b.amenities) ? b.amenities : String(b.amenities || '').split(',')).map(x => str(x, 40)).filter(Boolean).slice(0, 20)),
-  photos: JSON.stringify((Array.isArray(b.photos) ? b.photos : []).map(x => str(x, 300)).filter(x => /^\/[A-Za-z0-9._%\-\/]+$/.test(x)).slice(0, 30)), active: b.active === false || b.active === 0 ? 0 : 1, units: Math.min(50, Math.max(1, int(b.units, 1)))
+  photos: JSON.stringify((Array.isArray(b.photos) ? b.photos : []).map(x => str(x, 300)).filter(x => /^\/[A-Za-z0-9._%\-\/]+$/.test(x)).slice(0, 30)), active: b.active === false || b.active === 0 ? 0 : 1, units: Math.min(50, Math.max(1, int(b.units, 1))), caution: b.caution === '' || b.caution == null ? null : Math.max(0, int(b.caution))
 });
 route('GET', /^\/api\/admin\/apartments$/, 'admin', ({ res }) => J(res, 200, { apartments: all('SELECT * FROM apartments ORDER BY sort,id').map(aptOut) }));
 route('POST', /^\/api\/admin\/apartments$/, 'admin', ({ res, body }) => {
   const f = aptFields(body); if (!f.name) throw new HttpError(400, 'Enter the apartment name.');
   if (get('SELECT 1 FROM apartments WHERE name=?', f.name)) throw new HttpError(400, 'An apartment with that name already exists.');
   const sort = (get('SELECT COALESCE(MAX(sort),0)+1 s FROM apartments').s);
-  const r = run('INSERT INTO apartments(name,tagline,description,rate,capacity,amenities,photos,active,sort,units) VALUES(?,?,?,?,?,?,?,?,?,?)', f.name, f.tagline, f.description, f.rate, f.capacity, f.amenities, f.photos, f.active, sort, f.units);
+  const r = run('INSERT INTO apartments(name,tagline,description,rate,capacity,amenities,photos,active,sort,units,caution) VALUES(?,?,?,?,?,?,?,?,?,?,?)', f.name, f.tagline, f.description, f.rate, f.capacity, f.amenities, f.photos, f.active, sort, f.units, f.caution);
   audit('apartment.add', f.name); J(res, 200, { id: Number(r.lastInsertRowid) });
 });
 route('POST', /^\/api\/admin\/apartments\/(\d+)$/, 'admin', ({ res, body, m }) => {
   const id = Number(m[1]), cur = get('SELECT * FROM apartments WHERE id=?', id); if (!cur) throw new HttpError(404, 'Not found');
   const f = aptFields(body); if (!f.name) throw new HttpError(400, 'Enter the apartment name.');
   if (get('SELECT 1 FROM apartments WHERE name=? AND id<>?', f.name, id)) throw new HttpError(400, 'Another apartment already uses that name.');
-  run('UPDATE apartments SET name=?,tagline=?,description=?,rate=?,capacity=?,amenities=?,photos=?,active=?,units=? WHERE id=?', f.name, f.tagline, f.description, f.rate, f.capacity, f.amenities, f.photos, f.active, f.units, id);
+  run('UPDATE apartments SET name=?,tagline=?,description=?,rate=?,capacity=?,amenities=?,photos=?,active=?,units=?,caution=? WHERE id=?', f.name, f.tagline, f.description, f.rate, f.capacity, f.amenities, f.photos, f.active, f.units, f.caution, id);
   if (cur.name !== f.name) run('UPDATE bookings SET room=? WHERE room=?', f.name, cur.name);
   audit('apartment.update', f.name); J(res, 200, { ok: true });
 });
@@ -262,7 +265,7 @@ route('POST', /^\/api\/admin\/gallery\/(\d+)\/delete$/, 'admin', ({ res, m }) =>
 // admin: bookings
 const STATUSES = ['awaiting_payment', 'confirmed', 'checked_in', 'completed', 'cancelled'];
 const BK_COLS = ['ref', 'created_at', 'name', 'email', 'phone', 'room', 'checkin', 'checkout', 'nights', 'guests', 'rate', 'subtotal', 'caution', 'deposit', 'paid', 'status', 'source', 'message', 'notes'];
-route('GET', /^\/api\/admin\/bookings$/, true, ({ res }) => J(res, 200, { bookings: all('SELECT * FROM bookings ORDER BY created_at DESC, id DESC LIMIT 5000'), rooms: all('SELECT name FROM apartments ORDER BY sort,id').map(a => a.name) }));
+route('GET', /^\/api\/admin\/bookings$/, true, ({ res, w }) => J(res, 200, { bookings: all('SELECT * FROM bookings ORDER BY created_at DESC, id DESC LIMIT 5000').map(b => priv(w, b)), rooms: all('SELECT name FROM apartments ORDER BY sort,id').map(a => a.name), apts: all('SELECT name,rate,caution FROM apartments ORDER BY sort,id').map(a => ({ name: a.name, rate: a.rate, caution: a.caution == null ? getSite().caution_fee : a.caution })) }));
 route('GET', /^\/api\/admin\/bookings\.csv$/, 'admin', ({ res }) => {
   res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="phibs-bookings.csv"', 'Cache-Control': 'no-store' });
   res.end(toCsv(BK_COLS, all('SELECT * FROM bookings ORDER BY checkin DESC')));
@@ -270,10 +273,11 @@ route('GET', /^\/api\/admin\/bookings\.csv$/, 'admin', ({ res }) => {
 const bkFields = (b, base) => {
   const ci = str(b.checkin, 10), co = str(b.checkout, 10);
   if (!str(b.name, 120) || !isDate(ci) || !isDate(co) || co <= ci) throw new HttpError(400, 'Enter the guest name and valid dates.');
-  const nights = daysBetween(ci, co), rate = int(b.rate, base ? base.rate : 0), subtotal = b.subtotal === '' || b.subtotal == null ? nights * rate : int(b.subtotal);
+  const opt = (v, d) => (v === '' || v == null) ? d : int(v, d);
+  const nights = daysBetween(ci, co), rate = opt(b.rate, base ? base.rate : 0), subtotal = b.subtotal === '' || b.subtotal == null ? nights * rate : int(b.subtotal);
   return {
     name: str(b.name, 120), email: str(b.email, 160), phone: str(b.phone, 40), room: str(b.room, 120), checkin: ci, checkout: co, guests: Math.max(1, int(b.guests, 1)), nights, rate, subtotal,
-    caution: int(b.caution, base ? base.caution : getSite().caution_fee), deposit: int(b.deposit, Math.round(subtotal * getSite().deposit_pct / 100)), paid: Math.max(0, int(b.paid)),
+    caution: Math.max(0, opt(b.caution, base ? base.caution : getSite().caution_fee)), deposit: Math.max(0, opt(b.deposit, Math.round(subtotal * getSite().deposit_pct / 100))), paid: Math.max(0, int(b.paid)),
     status: STATUSES.includes(b.status) ? b.status : 'awaiting_payment', notes: str(b.notes, 1000), message: str(b.message, 1000)
   };
 };
@@ -281,22 +285,22 @@ const HOLDS = ['awaiting_payment', 'confirmed', 'checked_in'];
 const checkClash = (f, body, w, ex) => { const apt = get('SELECT * FROM apartments WHERE name=?', f.room);
   if (apt && HOLDS.includes(f.status) && !isFree(apt, f.checkin, f.checkout, ex) && !(w.role === 'admin' && body.force)) { const e = new HttpError(409, f.room + ' is already booked for some of those dates.'); e.clash = true; throw e; } };
 route('POST', /^\/api\/admin\/bookings$/, true, ({ res, body, w }) => {
-  const apt = get('SELECT rate FROM apartments WHERE name=?', str(body.room, 120)); if (apt && (body.rate == null || body.rate === '')) body.rate = apt.rate;
+  const apt = get('SELECT rate,caution FROM apartments WHERE name=?', str(body.room, 120)); if (apt && (body.rate == null || body.rate === '')) body.rate = apt.rate; if (apt && apt.caution != null && (body.caution == null || body.caution === '')) body.caution = apt.caution;
   const f = bkFields(body); checkClash(f, body, w, 0); const ref = newRef(), by = w.role === 'admin' ? 'admin' : w.name;
   const r = run('INSERT INTO bookings(ref,name,email,phone,room,checkin,checkout,guests,nights,rate,subtotal,caution,deposit,paid,status,notes,message,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     ref, f.name, f.email, f.phone, f.room, f.checkin, f.checkout, f.guests, f.nights, f.rate, f.subtotal, f.caution, f.deposit, f.paid, f.status, f.notes, f.message, 'added by ' + by);
-  if (f.paid > 0) run('INSERT INTO payments(booking_id,amount,method,note,by_name,created_at) VALUES(?,?,?,?,?,?)', Number(r.lastInsertRowid), f.paid, METHODS.includes(body.method) ? body.method : 'Transfer', 'Paid when booking was made', by, nowLagos());
+  if (f.paid > 0) run('INSERT INTO payments(booking_id,amount,method,note,by_name,by_user,created_at) VALUES(?,?,?,?,?,?,?)', Number(r.lastInsertRowid), f.paid, METHODS.includes(body.method) ? body.method : 'Transfer', 'Paid when booking was made', by, w.username || 'admin', nowLagos());
   audit('booking.add', ref); J(res, 200, { ref });
 });
 route('POST', /^\/api\/admin\/bookings\/(\d+)$/, true, ({ res, body, m, w }) => {
   const id = Number(m[1]), cur = get('SELECT * FROM bookings WHERE id=?', id); if (!cur) throw new HttpError(404, 'Not found');
-  const f = bkFields({ ...cur, ...body, paid: cur.paid }, cur); checkClash(f, body, w, id);
+  const f = bkFields({ ...cur, ...body, paid: cur.paid, ...(w.role === 'admin' ? {} : { phone: cur.phone, email: cur.email }) }, cur); checkClash(f, body, w, id);
   run('UPDATE bookings SET name=?,email=?,phone=?,room=?,checkin=?,checkout=?,guests=?,nights=?,rate=?,subtotal=?,caution=?,deposit=?,paid=?,status=?,notes=?,message=? WHERE id=?',
     f.name, f.email, f.phone, f.room, f.checkin, f.checkout, f.guests, f.nights, f.rate, f.subtotal, f.caution, f.deposit, f.paid, f.status, f.notes, f.message, id);
   audit('booking.update', cur.ref + ' ' + f.status); J(res, 200, { ok: true });
 });
 route('POST', /^\/api\/admin\/bookings\/(\d+)\/delete$/, 'admin', ({ res, m }) => { const b = get('SELECT ref FROM bookings WHERE id=?', Number(m[1])); run('DELETE FROM bookings WHERE id=?', Number(m[1])); audit('booking.delete', b && b.ref); J(res, 200, { ok: true }); });
-route('GET', /^\/api\/admin\/enquiries$/, true, ({ res }) => J(res, 200, { enquiries: all('SELECT * FROM enquiries ORDER BY id DESC LIMIT 1000') }));
+route('GET', /^\/api\/admin\/enquiries$/, true, ({ res, w }) => J(res, 200, { enquiries: all('SELECT * FROM enquiries ORDER BY id DESC LIMIT 1000').map(e => w.role === 'admin' ? e : { ...e, email: '', phone: '' }) }));
 route('POST', /^\/api\/admin\/enquiries\/(\d+)\/delete$/, 'admin', ({ res, m }) => { run('DELETE FROM enquiries WHERE id=?', Number(m[1])); J(res, 200, { ok: true }); });
 
 // admin: old system records
@@ -390,21 +394,21 @@ route('GET', /^\/api\/admin\/backup$/, 'admin', ({ res }) => {
 });
 
 /* ---------- payments and receipts ---------- */
-const payInfo = (id) => { const b = get('SELECT * FROM bookings WHERE id=?', id); if (!b) throw new HttpError(404, 'Not found');
+const payInfo = (id, w) => { const b = get('SELECT * FROM bookings WHERE id=?', id); if (!b) throw new HttpError(404, 'Not found');
   const payments = all('SELECT * FROM payments WHERE booking_id=? ORDER BY id', id), sum = payments.reduce((t, p) => t + p.amount, 0);
-  return { booking: b, payments, carried: Math.max(0, b.paid - sum), site: getSite() }; };
-route('GET', /^\/api\/admin\/bookings\/(\d+)\/payments$/, true, ({ res, m }) => J(res, 200, payInfo(Number(m[1]))));
+  return { booking: w ? priv(w, b) : b, payments, carried: Math.max(0, b.paid - sum), site: getSite() }; };
+route('GET', /^\/api\/admin\/bookings\/(\d+)\/payments$/, true, ({ res, m, w }) => J(res, 200, payInfo(Number(m[1]), w)));
 route('POST', /^\/api\/admin\/bookings\/(\d+)\/payments$/, true, ({ res, body, m, w }) => {
   const id = Number(m[1]), b = get('SELECT * FROM bookings WHERE id=?', id); if (!b) throw new HttpError(404, 'Not found');
   const amount = int(body.amount); if (amount <= 0 || amount > 2e9) throw new HttpError(400, 'Enter the amount received.');
-  run('INSERT INTO payments(booking_id,amount,method,note,by_name,created_at) VALUES(?,?,?,?,?,?)', id, amount, METHODS.includes(body.method) ? body.method : 'Transfer', str(body.note, 200), w.name, nowLagos());
+  run('INSERT INTO payments(booking_id,amount,method,note,by_name,by_user,created_at) VALUES(?,?,?,?,?,?,?)', id, amount, METHODS.includes(body.method) ? body.method : 'Transfer', str(body.note, 200), w.name, w.username || 'admin', nowLagos());
   const paid = b.paid + amount, status = b.status === 'awaiting_payment' && paid >= Math.max(1, Math.min(b.deposit || 1, b.subtotal || 1)) ? 'confirmed' : b.status;
   run('UPDATE bookings SET paid=?,status=? WHERE id=?', paid, status, id); audit('payment.add', b.ref + ' ' + amount + ' by ' + w.name);
-  J(res, 200, payInfo(id));
+  J(res, 200, payInfo(id, w));
 });
 route('POST', /^\/api\/admin\/payments\/(\d+)\/delete$/, 'admin', ({ res, m }) => {
   const p = get('SELECT * FROM payments WHERE id=?', Number(m[1])); if (!p) throw new HttpError(404, 'Not found');
-  run('DELETE FROM payments WHERE id=?', p.id); run('UPDATE bookings SET paid=MAX(0,paid-?) WHERE id=?', p.amount, p.booking_id); audit('payment.delete', p.booking_id + ' ' + p.amount); J(res, 200, payInfo(p.booking_id));
+  run('DELETE FROM payments WHERE id=?', p.id); run('UPDATE bookings SET paid=MAX(0,paid-?) WHERE id=?', p.amount, p.booking_id); audit('payment.delete', p.booking_id + ' ' + p.amount); J(res, 200, payInfo(p.booking_id, { role: 'admin' }));
 });
 
 /* ---------- payment summary (admin only) ---------- */
