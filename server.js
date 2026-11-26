@@ -1,206 +1,393 @@
+/* Phibs Luxury Homes: website + owner admin.
+   Zero-dependency Node server (Node 22.5+). The optional "pg" package is only used for the one-off
+   import of the old booking system. Data lives in SQLite inside DATA_DIR (use a Render persistent disk). */
 'use strict';
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
-const PORT = process.env.PORT || 3000, VIEWS = path.join(__dirname, 'views'), PUB = path.join(__dirname, 'public');
-const PG = !!process.env.DATABASE_URL;
+const { DatabaseSync } = require('node:sqlite');
 
-/* ---------- database: Postgres on Render, SQLite for local testing ---------- */
-let q;
-if (PG) {
-  const { Pool } = require('pg'), url = process.env.DATABASE_URL;
-  const pool = new Pool({ connectionString: url, ssl: /\.render\.com|sslmode=require/.test(url) ? { rejectUnauthorized: false } : false });
-  q = async (sql, p = []) => { let i = 0; return (await pool.query(sql.replace(/\?/g, () => '$' + (++i)), p)).rows; };
-} else {
-  const { DatabaseSync } = require('node:sqlite'); fs.mkdirSync(process.env.DATA_DIR || '.data', { recursive: true });
-  const sdb = new DatabaseSync(path.join(process.env.DATA_DIR || '.data', 'phibs.db'));
-  q = async (sql, p = []) => sdb.prepare(sql).all(...p);
+const PORT = Number(process.env.PORT) || 3000;
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const UPLOADS = path.join(DATA_DIR, 'uploads');
+fs.mkdirSync(UPLOADS, { recursive: true });
+let PERSISTENT = false;
+try { PERSISTENT = !!process.env.DATA_DIR && fs.statSync(DATA_DIR).dev !== fs.statSync(__dirname).dev; } catch {}
+console.log('Data folder: ' + DATA_DIR + (PERSISTENT ? ' (separate disk: data is kept)' : ' (NOT a persistent disk: data is erased on every deploy)'));
+
+const db = new DatabaseSync(path.join(DATA_DIR, 'phibs.db'));
+db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
+db.exec(`
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS apartments (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, tagline TEXT DEFAULT '', description TEXT DEFAULT '',
+  rate INTEGER NOT NULL DEFAULT 0, capacity INTEGER NOT NULL DEFAULT 2, amenities TEXT DEFAULT '[]', photos TEXT DEFAULT '[]', sort INTEGER DEFAULT 0, active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS gallery (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, caption TEXT DEFAULT '', sort INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  name TEXT, email TEXT, phone TEXT, room TEXT, checkin TEXT, checkout TEXT, guests INTEGER DEFAULT 1, nights INTEGER DEFAULT 1,
+  rate INTEGER DEFAULT 0, subtotal INTEGER DEFAULT 0, caution INTEGER DEFAULT 0, deposit INTEGER DEFAULT 0, paid INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'awaiting_payment', message TEXT DEFAULT '', notes TEXT DEFAULT '', source TEXT DEFAULT 'website');
+CREATE TABLE IF NOT EXISTS enquiries (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  name TEXT, email TEXT, room TEXT, checkin TEXT, checkout TEXT, guests TEXT, message TEXT, via TEXT);
+CREATE TABLE IF NOT EXISTS legacy_tables (name TEXT PRIMARY KEY, cols TEXT NOT NULL, row_count INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS legacy_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS legacy_tbl ON legacy_rows(tbl);
+CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT DEFAULT (datetime('now')), action TEXT, detail TEXT);
+`);
+const run = (sql, ...a) => db.prepare(sql).run(...a);
+const get = (sql, ...a) => db.prepare(sql).get(...a);
+const all = (sql, ...a) => db.prepare(sql).all(...a);
+const audit = (action, detail) => { try { run('INSERT INTO audit(action,detail) VALUES(?,?)', action, String(detail || '').slice(0, 300)); } catch {} };
+
+/* ---------- defaults (seeded once, then edited from the admin page) ---------- */
+const AMEN = ['Wifi', 'TV', 'Minibar', 'Balcony', 'Pool', 'Driver'];
+const DEFAULT_SITE = {
+  phone1: '+234 916 233 0835', phone2: '+234 816 640 4939', whatsapp: '2349162330835', email: 'info@phibluxuryhomes.com',
+  instagram: '@phibs_luxury_homess', rc: 'RC9372447', city: 'Abuja', incorporated: 'June 2022',
+  caution_fee: 50000, deposit_pct: 50,
+  hero_title: 'Your home away from home in Abuja.',
+  hero_text: 'Furnished shortlet apartments in Abuja where you can unwind, recharge and feel at home, with the space and privacy of your own place.',
+  about_title: 'Home-like comfort, wherever you travel.',
+  about_p1: 'Phibs Luxury Homes is a Nigerian company offering furnished shortlet apartments and luxury homes for rent in Abuja. Established in Nigeria and incorporated in June 2022, we exist to give guests a calm, comfortable and private place to stay, whether for business, a short getaway or an extended visit.',
+  about_p2: 'Every apartment is prepared with care, and our team is on hand from your first enquiry to checkout, so you can settle in and feel at home.',
+  about_image: '/phibs%20room%206.jpeg',
+  founder_name: 'Phibian Otache', founder_role: 'Founder & CEO, Phibs Luxury Homes',
+  founder_bio: 'Phibian founded Phibs Luxury Homes with a clear goal: to give guests a place that feels like home, comfortable, private and carefully looked after. He leads the company with a focus on quality spaces and warm, dependable service for every guest.',
+  founder_photo: '/phibs-founder.jpg'
+};
+const DEFAULT_APTS = [
+  ['Phibs Cozy Single', 'Cosy & comfortable', 'A welcoming personal space for guests who value comfort and simplicity.', 65000, 2, ['/phibs%20room%202.jpeg']],
+  ['Phibs Prestige Suite', 'Refined comfort', 'A more spacious setting for guests looking for an elevated stay.', 75000, 2, [1, 2, 3, 4, 5].map(i => `/phibs-prestige-${i}.jpg`)],
+  ['Phibs Diamond Suite', 'A little more luxury', 'Enjoy a polished, relaxing atmosphere with room to settle in.', 85000, 2, [1, 2, 3, 4, 5, 6].map(i => `/phibs-diamond-${i}.jpg`)],
+  ['Phibs Platinum Suite', 'Premium stay', 'A premium option for guests seeking a special stay experience.', 100000, 4, ['/phibs%20room%205.jpeg']]
+];
+const DEFAULT_GALLERY = ['/phibs%20room%202.jpeg', '/phibs%20room%203.jpeg', '/phibs%20room%205.jpeg', '/phibs%20room%206.jpeg'];
+if (!get("SELECT 1 FROM settings WHERE key='seeded'")) {
+  for (const [k, v] of Object.entries(DEFAULT_SITE)) run('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)', k, JSON.stringify(v));
+  DEFAULT_APTS.forEach((a, i) => run('INSERT INTO apartments(name,tagline,description,rate,capacity,amenities,photos,sort) VALUES(?,?,?,?,?,?,?,?)',
+    a[0], a[1], a[2], a[3], a[4], JSON.stringify(AMEN), JSON.stringify(a[5]), i));
+  DEFAULT_GALLERY.forEach((u, i) => run('INSERT INTO gallery(url,sort) VALUES(?,?)', u, i));
+  run("INSERT INTO settings(key,value) VALUES('seeded','true')");
 }
-const AUTO = PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT', BLOB = PG ? 'BYTEA' : 'BLOB';
+const getSite = () => { const o = { ...DEFAULT_SITE }; for (const r of all('SELECT key,value FROM settings')) if (r.key in DEFAULT_SITE) { try { o[r.key] = JSON.parse(r.value); } catch {} } return o; };
+const setSetting = (k, v) => run('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)', k, JSON.stringify(v));
+const aptOut = a => ({ id: a.id, name: a.name, tagline: a.tagline, description: a.description, rate: a.rate, capacity: a.capacity, amenities: JSON.parse(a.amenities || '[]'), photos: JSON.parse(a.photos || '[]'), active: !!a.active, sort: a.sort });
 
-/* ---------- helpers ---------- */
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const naira = n => '₦' + Number(n || 0).toLocaleString('en-NG');
-const refOf = n => 'PLH-' + String(n).padStart(3, '0');
-const J = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
-class Err extends Error { constructor(code, msg) { super(msg); this.code = code; } }
-const readBody = (req, max = 1e6) => new Promise((ok, no) => { const c = []; let n = 0; req.on('data', d => { n += d.length; if (n > max) { no(new Err(413, 'Too large.')); req.destroy(); } else c.push(d); }); req.on('end', () => ok(Buffer.concat(c))); req.on('error', no); });
-const readJson = async req => { try { return JSON.parse((await readBody(req)).toString() || '{}'); } catch (e) { if (e instanceof Err) throw e; throw new Err(400, 'Bad request.'); } };
-const hashPw = pw => { const s = crypto.randomBytes(16); return s.toString('hex') + ':' + crypto.scryptSync(pw, s, 64).toString('hex'); };
-const checkPw = (pw, h) => { const [s, k] = String(h).split(':'); if (!s || !k) return false; const a = crypto.scryptSync(pw, Buffer.from(s, 'hex'), 64), b = Buffer.from(k, 'hex'); return a.length === b.length && crypto.timingSafeEqual(a, b); };
-const hits = new Map(); const limited = (key, max, ms) => { const now = Date.now(), a = (hits.get(key) || []).filter(t => now - t < ms); a.push(now); hits.set(key, a); return a.length > max; };
+/* ---------- security helpers ---------- */
+const keyFile = path.join(DATA_DIR, 'secret.key');
+let SECRET; try { SECRET = fs.readFileSync(keyFile); } catch { SECRET = crypto.randomBytes(32); fs.writeFileSync(keyFile, SECRET, { mode: 0o600 }); }
+const hashPw = (pw) => { const salt = crypto.randomBytes(16); return salt.toString('hex') + ':' + crypto.scryptSync(pw, salt, 64).toString('hex'); };
+const checkPw = (pw, stored) => { try { const [s, h] = String(stored).split(':'); const a = crypto.scryptSync(pw, Buffer.from(s, 'hex'), 64), b = Buffer.from(h, 'hex'); return a.length === b.length && crypto.timingSafeEqual(a, b); } catch { return false; } };
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+(function bootstrapAdmin() { // ADMIN_PASSWORD from Render is applied whenever it changes
+  let env = String(process.env.ADMIN_PASSWORD || '').trim().replace(/^["']|["']$/g, '');
+  if (!env) { if (!get("SELECT 1 FROM settings WHERE key='admin_hash'")) { env = crypto.randomBytes(9).toString('base64url'); console.log('No ADMIN_PASSWORD set. Temporary admin password: ' + env); } else return; }
+  const cur = get("SELECT value FROM settings WHERE key='admin_env_hash'");
+  if (!cur || JSON.parse(cur.value) !== sha(env) || !get("SELECT 1 FROM settings WHERE key='admin_hash'")) { setSetting('admin_hash', hashPw(env)); setSetting('admin_env_hash', sha(env)); console.log('Admin password set from ADMIN_PASSWORD (username: admin)'); }
+})();
+const sign = (p) => { const b = Buffer.from(JSON.stringify(p)).toString('base64url'); return b + '.' + crypto.createHmac('sha256', SECRET).update(b).digest('base64url'); };
+const verify = (t) => { try { const [b, s] = String(t).split('.'); const ok = crypto.createHmac('sha256', SECRET).update(b).digest('base64url'); if (s.length !== ok.length || !crypto.timingSafeEqual(Buffer.from(s), Buffer.from(ok))) return null; const p = JSON.parse(Buffer.from(b, 'base64url').toString()); return p.exp > Date.now() ? p : null; } catch { return null; } };
+const adminVer = () => sha(JSON.parse(get("SELECT value FROM settings WHERE key='admin_hash'").value)).slice(0, 12);
+const cookieOf = (req) => { const m = /(?:^|;\s*)sid=([^;]+)/.exec(req.headers.cookie || ''); return m ? m[1] : ''; };
+const isAdmin = (req) => { const p = verify(cookieOf(req)); return !!p && p.v === adminVer(); };
+const buckets = new Map();
+const limit = (key, max, windowMs) => { const now = Date.now(); const b = (buckets.get(key) || []).filter(t => now - t < windowMs); if (b.length >= max) { buckets.set(key, b); return false; } b.push(now); buckets.set(key, b); return true; };
+setInterval(() => { const now = Date.now(); for (const [k, v] of buckets) if (!v.some(t => now - t < 3600e3)) buckets.delete(k); }, 600e3).unref();
+const ipOf = (req) => (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 
-/* ---------- defaults read from the page templates ---------- */
-const VIEW = n => fs.readFileSync(path.join(VIEWS, n), 'utf8');
-const INDEX = VIEW('index.html'), BOOKING = VIEW('booking.html'), ADMIN = VIEW('admin.html');
-const FIELDS = [...INDEX.matchAll(/<(\w+) data-cms="([^"]+)" data-label="([^"]*)"[^>]*>([\s\S]*?)<\/\1>/g)].map(m => ({ key: m[2], label: m[3], def: m[4].replace(/<br>/g, '\n').replace(/&amp;/g, '&') }));
-const ROOMS = [...INDEX.matchAll(/<article class="room-card">([\s\S]*?)<\/article>/g)].map(m => { const c = m[1]; return {
-  name: /<h3>(.*?)<\/h3>/.exec(c)[1], tag: (/<span class="room-tag">(.*?)<\/span>/.exec(c) || [])[1] || '', desc: (/<\/h3><p>(.*?)<\/p>/.exec(c) || [])[1] || '',
-  rate: Number(/<b>₦([\d,]+)<\/b>/.exec(c)[1].replace(/,/g, '')), cap: Number((/Sleeps (\d+)/.exec(c) || [0, 2])[1]), img: /<img data-img="[^"]*" src="([^"]*)"/.exec(c)[1] }; });
-const SET_DEF = { email: 'info@phibluxuryhomes.com', phone1: '+234 916 233 0835', phone1_tel: '+2349162330835', phone2: '+234 816 640 4939', phone2_tel: '+2348166404939', whatsapp: '2349162330835', caution: 50000, deposit: 50, receipt_next: 1 };
+/* ---------- utilities ---------- */
+class HttpError extends Error { constructor(s, m) { super(m); this.status = s; } }
+const J = (res, s, o) => { res.writeHead(s, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(o)); };
+const str = (v, n = 500) => String(v == null ? '' : v).trim().slice(0, n);
+const int = (v, d = 0) => { const n = Math.round(Number(String(v == null ? '' : v).replace(/[^0-9.\-]/g, ''))); return Number.isFinite(n) ? n : d; };
+const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(Date.parse(s + 'T00:00:00Z'));
+const lagosToday = () => new Date(Date.now() + 3600e3).toISOString().slice(0, 10);
+const daysBetween = (a, b) => Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / 86400e3);
+const newRef = () => { const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < 6; i++) s += c[crypto.randomInt(c.length)]; return 'PHB-' + s; };
+const readBody = (req, max) => new Promise((resolve, reject) => {
+  let size = 0; const chunks = [];
+  req.on('data', c => { size += c.length; if (size > max) { reject(new HttpError(413, 'That file is too large.')); req.destroy(); } else chunks.push(c); });
+  req.on('end', () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {}); } catch { reject(new HttpError(400, 'Bad request.')); } });
+  req.on('error', reject);
+});
+const csvCell = (v) => { const s = v == null ? '' : String(v); return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+const toCsv = (cols, rows) => '﻿' + [cols.join(',')].concat(rows.map(r => cols.map(c => csvCell(r[c])).join(','))).join('\r\n');
 
-const content = async () => { const o = {}; for (const r of await q('SELECT k, v FROM content')) o[r.k] = r.v; return o; };
-const setContent = (k, v) => q('DELETE FROM content WHERE k = ?', [k]).then(() => v == null ? null : q('INSERT INTO content(k, v) VALUES(?, ?)', [k, String(v)]));
-const settings = ov => { const s = { ...SET_DEF }; try { Object.assign(s, JSON.parse(ov.settings || '{}')); } catch (e) {} return s; };
-const rooms = ov => { let o = {}; try { o = JSON.parse(ov.rooms || '{}'); } catch (e) {} return ROOMS.map(r => { const x = o[r.name] || {}, m = ov['img.room:' + r.name];
-  return { name: r.name, tag: x.tag != null ? x.tag : r.tag, desc: x.desc != null ? x.desc : r.desc, rate: x.rate > 0 ? x.rate : r.rate, cap: x.cap > 0 ? x.cap : r.cap, img: m ? '/media/' + m : r.img }; }); };
+/* ---------- routes ---------- */
+const routes = [];
+const route = (method, re, auth, fn) => routes.push({ method, re, auth, fn });
+const bookingOut = (b) => ({ ...b });
 
-/* ---------- page rendering ---------- */
-function render(tpl, ov, isBooking) {
-  const S = settings(ov), R = rooms(ov); let h = tpl;
-  h = h.replace(/<(\w+) data-cms="([^"]+)" data-label="([^"]*)"([^>]*)>([\s\S]*?)<\/\1>/g, (m, tag, key, label, rest, inner) => ov['text.' + key] == null ? m : `<${tag} data-cms="${key}" data-label="${label}"${rest}>${esc(ov['text.' + key]).replace(/\n/g, '<br>')}</${tag}>`);
-  h = h.replace(/<article class="room-card">[\s\S]*?<\/article>/g, card => { const n = /<h3>(.*?)<\/h3>/.exec(card)[1], r = R.find(x => x.name === n); if (!r) return card;
-    return card.replace(/(<span class="room-tag">)(.*?)(<\/span>)/, (m, a, b, c) => a + esc(r.tag) + c).replace(/(<\/h3><p>)(.*?)(<\/p>)/, (m, a, b, c) => a + esc(r.desc) + c)
-      .replace(/<b>₦[\d,]+<\/b>/, '<b>' + naira(r.rate) + '</b>').replace(/Sleeps \d+/, 'Sleeps ' + r.cap); });
-  h = h.replace(/<img data-img="([^"]+)" src="([^"]*)"/g, (m, slot, src) => { const id = ov['img.' + slot]; return `<img data-img="${slot}" src="${id ? '/media/' + id : src}"`; });
-  let gal = []; try { gal = JSON.parse(ov.gallery || '[]'); } catch (e) {}
-  if (gal.length) h = h.replace(/(<div class="gallery" data-cms-gallery>)[\s\S]*?(<\/div>)/, (m, a, b) => a + gal.map(id => `<img src="/media/${id}" alt="Apartment photo" loading="lazy">`).join('') + b);
-  const tok = [['+2349162330835', 'P1T', S.phone1_tel], ['+234 916 233 0835', 'P1', S.phone1], ['+2348166404939', 'P2T', S.phone2_tel], ['+234 816 640 4939', 'P2', S.phone2], ['2349162330835', 'WA', S.whatsapp], ['info@phibluxuryhomes.com', 'EM', S.email]];
-  tok.forEach(t => { h = h.split(t[0]).join('@@' + t[1] + '@@'); }); tok.forEach(t => { h = h.split('@@' + t[1] + '@@').join(esc(t[2])); });
-  if (isBooking) { const cfg = { whatsapp: S.whatsapp, email: S.email, cautionFee: Number(S.caution), depositPct: Number(S.deposit), rooms: {} };
-    R.forEach(r => { cfg.rooms[r.name] = { img: r.img, tag: r.tag, rate: r.rate, cap: r.cap }; });
-    h = h.replace('</head>', '<script>window.__CFG=' + JSON.stringify(cfg).replace(/</g, '\\u003c') + ';</script></head>'); }
-  return h;
-}
+// public
+route('GET', /^\/api\/site$/, false, ({ res }) => J(res, 200, {
+  site: getSite(), apartments: all('SELECT * FROM apartments WHERE active=1 ORDER BY sort,id').map(aptOut), gallery: all('SELECT id,url,caption FROM gallery ORDER BY sort,id')
+}));
+route('POST', /^\/api\/bookings$/, false, ({ req, res, body }) => {
+  if (!limit('bk|' + ipOf(req), 12, 3600e3)) throw new HttpError(429, 'Too many bookings from this device. Please call us.');
+  const site = getSite(), apt = get('SELECT * FROM apartments WHERE name=? AND active=1', str(body.room, 120));
+  const name = str(body.name, 120), email = str(body.email, 160), phone = str(body.phone, 40), ci = str(body.checkin, 10), co = str(body.checkout, 10);
+  if (!apt || !name || !email || !phone || !isDate(ci) || !isDate(co) || co <= ci) throw new HttpError(400, 'Please check the booking details.');
+  if (ci < lagosToday()) throw new HttpError(400, 'Check-in cannot be in the past.');
+  const guests = Math.min(Math.max(int(body.guests, 1), 1), apt.capacity), nights = daysBetween(ci, co), subtotal = nights * apt.rate;
+  const deposit = Math.round(subtotal * site.deposit_pct / 100);
+  let ref = newRef(); while (get('SELECT 1 FROM bookings WHERE ref=?', ref)) ref = newRef();
+  run('INSERT INTO bookings(ref,name,email,phone,room,checkin,checkout,guests,nights,rate,subtotal,caution,deposit,message) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    ref, name, email, phone, apt.name, ci, co, guests, nights, apt.rate, subtotal, site.caution_fee, deposit, str(body.message, 1000));
+  audit('booking.new', ref + ' ' + apt.name);
+  J(res, 200, { ref, nights, rate: apt.rate, subtotal, deposit, caution: site.caution_fee, guests });
+});
+route('POST', /^\/api\/enquiries$/, false, ({ req, res, body }) => {
+  if (!limit('eq|' + ipOf(req), 20, 3600e3)) throw new HttpError(429, 'Too many requests.');
+  run('INSERT INTO enquiries(name,email,room,checkin,checkout,guests,message,via) VALUES(?,?,?,?,?,?,?,?)', str(body.name, 120), str(body.email, 160), str(body.room, 120), str(body.checkin, 10), str(body.checkout, 10), str(body.guests, 10), str(body.message, 1000), str(body.via, 20));
+  J(res, 200, { ok: true });
+});
+route('POST', /^\/api\/admin\/login$/, false, ({ req, res, body }) => {
+  const key = 'login|' + ipOf(req); if (!limit(key, 8, 900e3)) throw new HttpError(429, 'Too many attempts. Wait 15 minutes and try again.');
+  const pw = String(body.password || ''), h = JSON.parse(get("SELECT value FROM settings WHERE key='admin_hash'").value);
+  if (!(checkPw(pw, h) || checkPw(pw.trim(), h))) { audit('login.fail', ipOf(req)); throw new HttpError(401, 'Wrong password.'); }
+  const secure = (req.headers['x-forwarded-proto'] || '').includes('https') ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `sid=${sign({ exp: Date.now() + 12 * 3600e3, v: adminVer() })}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${secure}`);
+  J(res, 200, { ok: true });
+});
+route('POST', /^\/api\/admin\/logout$/, false, ({ res }) => { res.setHeader('Set-Cookie', 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); J(res, 200, { ok: true }); });
+route('GET', /^\/api\/admin\/me$/, false, ({ req, res }) => J(res, 200, { admin: isAdmin(req), persistent: PERSISTENT, dir: isAdmin(req) ? DATA_DIR : undefined }));
 
-/* ---------- receipts ---------- */
-function receiptPage(b, ov) {
-  const S = settings(ov), paid = Number(b.amount_paid) || 0, total = b.subtotal + b.caution, label = { pending: 'Awaiting payment', confirmed: 'Confirmed', paid: 'Paid', cancelled: 'Cancelled', completed: 'Completed' }[b.status] || b.status;
-  const row = (a, c) => `<div class="row"><span>${a}</span><strong>${c}</strong></div>`;
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Receipt ${refOf(b.receipt_no)} | Phibs Luxury Homes</title><link rel="icon" href="/logo.png">
-<style>body{margin:0;background:#f7f5ef;font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;color:#17231f}.sheet{max-width:720px;margin:24px auto;background:#fff;border:1px solid #e7e4dc;padding:0 0 18px}
-.head{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:24px 30px;border-bottom:3px solid #c5a36a}.head img{height:72px}.ref{text-align:right}.ref small{display:block;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#69736d}.ref b{font:600 26px Georgia,serif;color:#183b32}
-.body{padding:8px 30px}h4{margin:22px 0 6px;font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#69736d}.row{display:flex;justify-content:space-between;gap:16px;padding:7px 0;border-bottom:1px solid #eee}.big{font-size:18px;color:#183b32}
-.badge{display:inline-block;background:#183b32;color:#fff;border-radius:99px;padding:3px 12px;font-size:12px;margin-top:8px}.foot{padding:14px 30px 0;color:#69736d;font-size:13px}.btn{display:block;margin:20px auto 0;background:#183b32;color:#fff;border:0;border-radius:6px;padding:12px 22px;font:inherit;cursor:pointer}
-@media print{body{background:#fff}.sheet{border:0;margin:0}.btn{display:none}.head{-webkit-print-color-adjust:exact;print-color-adjust:exact}}</style></head><body><div class="sheet">
-<div class="head"><img src="/logo.png" alt="Phibs Luxury Homes"><div class="ref"><small>Booking receipt</small><b>${refOf(b.receipt_no)}</b></div></div><div class="body">
-<span class="badge">${esc(label)}</span><h4>Guest</h4>${row('Name', esc(b.name))}${row('Email', esc(b.email))}${row('Phone', esc(b.phone))}${row('Issued', esc(new Date(b.created_at).toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })))}
-<h4>Stay</h4>${row('Apartment', esc(b.room))}${row('Check-in', esc(b.checkin))}${row('Check-out', esc(b.checkout))}${row('Nights / Guests', b.nights + ' / ' + esc(b.guests))}
-<h4>Payment summary</h4>${row('Rate per night', naira(b.rate))}${row(b.nights + ' night' + (b.nights > 1 ? 's' : ''), naira(b.subtotal))}${row('Caution fee (refundable)', naira(b.caution))}${row('Total payable before check-in', '<span class="big">' + naira(total) + '</span>')}${row(S.deposit + '% deposit to confirm booking', naira(b.deposit))}${paid ? row('Amount received', naira(paid)) + row('Balance', naira(Math.max(0, total - paid))) : ''}
-</div><div class="foot">Phibs Luxury Homes, Abuja<br>${esc(S.phone1)} &middot; ${esc(S.email)}<br>Please pay only to the official Phibs Luxury Homes account shared by our team. This receipt is subject to the Booking, Cancellation &amp; Refund Policy.</div>
-<button class="btn" onclick="print()">Print / Save as PDF</button></div></body></html>`;
-}
-
-/* ---------- admin session ---------- */
-let SECRET = process.env.SESSION_SECRET || '';
-const sign = v => crypto.createHmac('sha256', SECRET).update(v).digest('base64url');
-const makeSession = u => { const p = Buffer.from(JSON.stringify({ u, e: Date.now() + 12 * 3600e3 })).toString('base64url'); return p + '.' + sign(p); };
-const sessionUser = req => { const m = /(?:^|;\s*)sid=([^;]+)/.exec(req.headers.cookie || ''); if (!m) return null; const [p, s] = m[1].split('.'); if (!p || !s || sign(p) !== s) return null; try { const d = JSON.parse(Buffer.from(p, 'base64url')); return d.e > Date.now() ? d.u : null; } catch (e) { return null; } };
-const origin = req => ((req.headers['x-forwarded-proto'] || 'http').split(',')[0]) + '://' + req.headers.host;
-const MIME = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.css': 'text/css', '.js': 'text/javascript' };
-const num = (v, d = 0) => { const n = Math.round(Number(String(v).replace(/,/g, ''))); return Number.isFinite(n) ? n : d; };
-const slotOk = s => s === 'about' || s === 'founder' || s === 'gallery' || (s.startsWith('room:') && ROOMS.some(r => 'room:' + r.name === s));
-
-async function booking(req, res) {
-  if (limited('bk|' + req.socket.remoteAddress, 12, 3600e3)) throw new Err(429, 'Too many bookings from this connection. Please try again later.');
-  const b = await readJson(req), ov = await content(), S = settings(ov), room = rooms(ov).find(r => r.name === b.room);
-  const name = String(b.name || '').trim().slice(0, 120), email = String(b.email || '').trim().slice(0, 160), phone = String(b.phone || '').trim().slice(0, 40), msg = String(b.message || '').trim().slice(0, 1000);
-  if (name.length < 2) throw new Err(400, 'Please enter your full name.');
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Err(400, 'Please enter a valid email address.');
-  if (phone.replace(/\D/g, '').length < 7) throw new Err(400, 'Please enter a valid phone number.');
-  if (!room) throw new Err(400, 'Please choose an apartment.');
-  const ci = Date.parse(b.checkin + 'T00:00:00Z'), co = Date.parse(b.checkout + 'T00:00:00Z'), nights = Math.round((co - ci) / 864e5);
-  if (!(nights >= 1 && nights <= 90)) throw new Err(400, 'Please choose valid check-in and check-out dates.');
-  const guests = parseInt(b.guests, 10) || 1; if (guests > room.cap) throw new Err(400, 'This apartment sleeps up to ' + room.cap + ' guests.');
-  const subtotal = room.rate * nights, deposit = Math.round(subtotal * Number(S.deposit) / 100), token = crypto.randomBytes(12).toString('hex'), now = new Date().toISOString();
-  for (let i = 0; i < 6; i++) {
-    const n = Math.max(Number((await q('SELECT COALESCE(MAX(receipt_no), 0) + 1 AS n FROM bookings'))[0].n), num(S.receipt_next, 1));
-    try {
-      await q('INSERT INTO bookings(receipt_no, token, name, email, phone, room, checkin, checkout, guests, message, nights, rate, subtotal, deposit, caution, status, amount_paid, notes, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-        [n, token, name, email, phone, room.name, b.checkin, b.checkout, String(b.guests), msg, nights, room.rate, subtotal, deposit, Number(S.caution), 'pending', 0, '', now]);
-      const ref = refOf(n); return J(res, 200, { booking: { ref, issued: now, name, email, phone, room: room.name, checkin: b.checkin, checkout: b.checkout, guests: String(b.guests), message: msg, money: { rate: room.rate, nights, subtotal, deposit }, url: origin(req) + '/receipt/' + ref + '?k=' + token } });
-    } catch (e) { if (!/unique|duplicate/i.test(e.message)) throw e; }
+// admin: summary + site
+route('GET', /^\/api\/admin\/summary$/, true, ({ res }) => {
+  const today = lagosToday(), c = (sql, ...a) => get(sql, ...a).c;
+  J(res, 200, {
+    persistent: PERSISTENT,
+    awaiting: c("SELECT COUNT(*) c FROM bookings WHERE status='awaiting_payment'"), confirmed: c("SELECT COUNT(*) c FROM bookings WHERE status='confirmed'"),
+    upcoming: all("SELECT * FROM bookings WHERE checkin>=? AND status IN ('confirmed','awaiting_payment') ORDER BY checkin LIMIT 8", today),
+    inHouse: all("SELECT * FROM bookings WHERE checkin<=? AND checkout>? AND status IN ('confirmed','checked_in')", today, today),
+    enquiries: c('SELECT COUNT(*) c FROM enquiries'), total: c("SELECT COUNT(*) c FROM bookings WHERE status<>'cancelled'"),
+    collected: get("SELECT COALESCE(SUM(paid),0) s FROM bookings WHERE status<>'cancelled'").s,
+    legacy: all('SELECT name,row_count FROM legacy_tables ORDER BY name')
+  });
+});
+route('GET', /^\/api\/admin\/site$/, true, ({ res }) => J(res, 200, { site: getSite() }));
+route('POST', /^\/api\/admin\/site$/, true, ({ res, body }) => {
+  for (const k of Object.keys(DEFAULT_SITE)) {
+    if (!(k in body)) continue;
+    const num = typeof DEFAULT_SITE[k] === 'number'; setSetting(k, num ? Math.max(0, int(body[k])) : str(body[k], k.startsWith('about_p') || k === 'founder_bio' || k === 'hero_text' ? 1500 : 300));
   }
-  throw new Err(500, 'Could not issue a receipt number. Please try again.');
-}
-
-async function admin(req, res, p, url) {
-  const m = req.method, ov = await content();
-  if (p === '/api/admin/login' && m === 'POST') {
-    const b = await readJson(req), u = String(b.username || '').trim().toLowerCase();
-    if (limited('login|' + req.socket.remoteAddress + '|' + u, 8, 900e3)) throw new Err(429, 'Too many attempts. Wait 15 minutes and try again.');
-    const a = (await q('SELECT * FROM admins WHERE username = ?', [u]))[0];
-    if (!a || !checkPw(String(b.password || ''), a.pass_hash)) throw new Err(401, 'Wrong username or password.');
-    res.setHeader('Set-Cookie', 'sid=' + makeSession(u) + '; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200' + (origin(req).startsWith('https') ? '; Secure' : '')); return J(res, 200, { ok: true });
-  }
-  const user = sessionUser(req); if (!user) throw new Err(401, 'Please log in.');
-  if (p === '/api/admin/logout') { res.setHeader('Set-Cookie', 'sid=; Max-Age=0; Path=/'); return J(res, 200, { ok: true }); }
-  if (p === '/api/admin/state') {
-    const gal = JSON.parse(ov.gallery || '[]'), S = settings(ov);
-    return J(res, 200, { user, fields: FIELDS.map(f => ({ key: f.key, label: f.label, def: f.def, value: ov['text.' + f.key] != null ? ov['text.' + f.key] : f.def })), settings: S, rooms: rooms(ov),
-      slots: { about: ov['img.about'] ? '/media/' + ov['img.about'] : null, founder: ov['img.founder'] ? '/media/' + ov['img.founder'] : null }, gallery: gal });
-  }
-  if (p === '/api/admin/text' && m === 'POST') { const b = await readJson(req); for (const f of FIELDS) if (b[f.key] != null) await setContent('text.' + f.key, String(b[f.key]) === f.def ? null : String(b[f.key]).slice(0, 4000)); return J(res, 200, { ok: true }); }
-  if (p === '/api/admin/settings' && m === 'POST') {
-    const b = await readJson(req), S = settings(ov);
-    for (const k of ['email', 'phone1', 'phone1_tel', 'phone2', 'phone2_tel', 'whatsapp']) if (b[k] != null) S[k] = String(b[k]).trim().slice(0, 80);
-    for (const k of ['caution', 'deposit', 'receipt_next']) if (b[k] != null) S[k] = Math.max(0, num(b[k], SET_DEF[k]));
-    if (S.deposit > 100) throw new Err(400, 'Deposit cannot be more than 100%.'); await setContent('settings', JSON.stringify(S)); return J(res, 200, { ok: true });
-  }
-  if (p === '/api/admin/rooms' && m === 'POST') { const b = await readJson(req), o = {}; for (const r of b.rooms || []) if (ROOMS.some(x => x.name === r.name)) o[r.name] = { tag: String(r.tag || '').slice(0, 60), desc: String(r.desc || '').slice(0, 300), rate: Math.max(1, num(r.rate, 1)), cap: Math.min(12, Math.max(1, num(r.cap, 2))) }; await setContent('rooms', JSON.stringify(o)); return J(res, 200, { ok: true }); }
-  if (p === '/api/admin/upload' && m === 'POST') {
-    const slot = url.searchParams.get('slot') || '', mime = (req.headers['content-type'] || '').split(';')[0]; if (!slotOk(slot)) throw new Err(400, 'Unknown photo slot.'); if (!/^image\/(jpeg|png|webp)$/.test(mime)) throw new Err(400, 'Use a JPG, PNG or WebP photo.');
-    const buf = await readBody(req, 8e6); if (buf.length < 200) throw new Err(400, 'Empty file.');
-    const id = String((await q('INSERT INTO media(mime, data, created_at) VALUES(?,?,?) RETURNING id', [mime, buf, new Date().toISOString()]))[0].id);
-    if (slot === 'gallery') { const g = JSON.parse(ov.gallery || '[]'); g.push(id); await setContent('gallery', JSON.stringify(g)); }
-    else { if (ov['img.' + slot]) await q('DELETE FROM media WHERE id = ?', [ov['img.' + slot]]); await setContent('img.' + slot, id); }
-    return J(res, 200, { id });
-  }
-  if (p === '/api/admin/photo/remove' && m === 'POST') {
-    const b = await readJson(req), slot = String(b.slot || ''); if (!slotOk(slot)) throw new Err(400, 'Unknown photo slot.');
-    if (slot === 'gallery') { const g = JSON.parse(ov.gallery || '[]').filter(x => x !== String(b.id)); await q('DELETE FROM media WHERE id = ?', [String(b.id)]); await setContent('gallery', g.length ? JSON.stringify(g) : null); }
-    else if (ov['img.' + slot]) { await q('DELETE FROM media WHERE id = ?', [ov['img.' + slot]]); await setContent('img.' + slot, null); }
-    return J(res, 200, { ok: true });
-  }
-  if (p === '/api/admin/bookings' && m === 'GET') return J(res, 200, { bookings: (await q('SELECT * FROM bookings ORDER BY receipt_no DESC LIMIT 1000')).map(b => ({ ...b, ref: refOf(b.receipt_no), url: '/receipt/' + refOf(b.receipt_no) + '?k=' + b.token })) });
-  if (p === '/api/admin/bookings.csv') {
-    const rows = await q('SELECT * FROM bookings ORDER BY receipt_no'), cols = ['receipt_no', 'name', 'email', 'phone', 'room', 'checkin', 'checkout', 'guests', 'nights', 'rate', 'subtotal', 'deposit', 'caution', 'status', 'amount_paid', 'notes', 'created_at'];
-    const cell = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="phibs-bookings.csv"' });
-    return res.end(['reference'].concat(cols.slice(1)).join(',') + '\n' + rows.map(r => [refOf(r.receipt_no)].concat(cols.slice(1).map(c => r[c])).map(cell).join(',')).join('\n'));
-  }
-  let mm = /^\/api\/admin\/bookings\/(\d+)$/.exec(p);
-  if (mm && m === 'POST') { const b = await readJson(req); if (!['pending', 'confirmed', 'paid', 'cancelled', 'completed'].includes(b.status)) throw new Err(400, 'Unknown status.'); await q('UPDATE bookings SET status = ?, amount_paid = ?, notes = ? WHERE id = ?', [b.status, Math.max(0, num(b.amount_paid)), String(b.notes || '').slice(0, 500), Number(mm[1])]); return J(res, 200, { ok: true }); }
-  if (p === '/api/admin/password' && m === 'POST') {
-    const b = await readJson(req), a = (await q('SELECT * FROM admins WHERE username = ?', [user]))[0];
-    if (!a || !checkPw(String(b.current || ''), a.pass_hash)) throw new Err(400, 'Your current password is not correct.'); if (String(b.next || '').length < 10) throw new Err(400, 'Use at least 10 characters for the new password.');
-    await q('UPDATE admins SET pass_hash = ? WHERE username = ?', [hashPw(String(b.next)), user]); return J(res, 200, { ok: true });
-  }
-  throw new Err(404, 'Not found.');
-}
-
-const server = http.createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url, 'http://x'), p = decodeURIComponent(url.pathname);
-    res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'same-origin');
-    if (p === '/healthz') return J(res, 200, { ok: true });
-    if (p.startsWith('/api/admin/')) return await admin(req, res, p, url);
-    if (p === '/api/bookings' && req.method === 'POST') return await booking(req, res);
-    if (p === '/' || p === '/index.html' || p === '/booking.html') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' }); return res.end(render(p === '/booking.html' ? BOOKING : INDEX, await content(), p === '/booking.html')); }
-    if (p === '/admin') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end(ADMIN); }
-    let mm = /^\/media\/(\d+)$/.exec(p);
-    if (mm) { const r = (await q('SELECT mime, data FROM media WHERE id = ?', [Number(mm[1])]))[0]; if (!r) throw new Err(404, 'Not found.'); res.writeHead(200, { 'Content-Type': r.mime, 'Cache-Control': 'public, max-age=31536000, immutable' }); return res.end(Buffer.from(r.data)); }
-    mm = /^\/receipt\/PLH-(\d+)$/.exec(p);
-    if (mm) { const b = (await q('SELECT * FROM bookings WHERE receipt_no = ?', [Number(mm[1])]))[0], k = url.searchParams.get('k') || '';
-      if (!b || k.length !== b.token.length || !crypto.timingSafeEqual(Buffer.from(k), Buffer.from(b.token))) throw new Err(404, 'Receipt not found.');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end(receiptPage(b, await content())); }
-    const f = path.join(PUB, p);
-    if (f.startsWith(PUB + path.sep) && MIME[path.extname(f).toLowerCase()] && fs.existsSync(f)) { res.writeHead(200, { 'Content-Type': MIME[path.extname(f).toLowerCase()], 'Cache-Control': 'public, max-age=86400' }); return fs.createReadStream(f).pipe(res); }
-    throw new Err(404, 'Page not found.');
-  } catch (e) {
-    const code = e.code && Number.isInteger(e.code) ? e.code : 500; if (code === 500) console.error(e);
-    if (res.headersSent) return res.end(); const wantsJson = (req.url || '').startsWith('/api/');
-    if (wantsJson) return J(res, code, { error: code === 500 ? 'Something went wrong. Please try again.' : e.message });
-    res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' }); res.end('<!doctype html><meta charset="utf-8"><title>' + code + '</title><body style="font:16px system-ui;padding:48px"><h1>' + (code === 404 ? 'Page not found' : 'Something went wrong') + '</h1><p><a href="/">Back to Phibs Luxury Homes</a></p>');
-  }
+  audit('site.update', Object.keys(body).join(',')); J(res, 200, { site: getSite() });
+});
+route('POST', /^\/api\/admin\/password$/, true, ({ res, body }) => {
+  const h = JSON.parse(get("SELECT value FROM settings WHERE key='admin_hash'").value), np = String(body.new_password || '');
+  if (!checkPw(String(body.old_password || ''), h)) throw new HttpError(400, 'Current password is wrong.');
+  if (np.length < 8) throw new HttpError(400, 'New password must be at least 8 characters.');
+  setSetting('admin_hash', hashPw(np)); audit('password.change', ''); // other sessions end; sign this one in again
+  const secure = '';
+  res.setHeader('Set-Cookie', `sid=${sign({ exp: Date.now() + 12 * 3600e3, v: adminVer() })}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${secure}`);
+  J(res, 200, { ok: true });
 });
 
-(async () => {
-  await q(`CREATE TABLE IF NOT EXISTS admins (id ${AUTO}, username TEXT UNIQUE NOT NULL, pass_hash TEXT NOT NULL)`);
-  await q('CREATE TABLE IF NOT EXISTS content (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
-  await q(`CREATE TABLE IF NOT EXISTS media (id ${AUTO}, mime TEXT NOT NULL, data ${BLOB} NOT NULL, created_at TEXT NOT NULL)`);
-  await q(`CREATE TABLE IF NOT EXISTS bookings (id ${AUTO}, receipt_no INTEGER UNIQUE NOT NULL, token TEXT NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL, room TEXT NOT NULL, checkin TEXT NOT NULL, checkout TEXT NOT NULL, guests TEXT, message TEXT, nights INTEGER NOT NULL, rate INTEGER NOT NULL, subtotal INTEGER NOT NULL, deposit INTEGER NOT NULL, caution INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', amount_paid INTEGER NOT NULL DEFAULT 0, notes TEXT, created_at TEXT NOT NULL)`);
-  if (!SECRET) { const r = (await q("SELECT v FROM content WHERE k = 'session_secret'"))[0]; SECRET = r ? r.v : crypto.randomBytes(32).toString('hex'); if (!r) await setContent('session_secret', SECRET); }
-  if (!(await q('SELECT id FROM admins LIMIT 1')).length) {
-    const pw = process.env.ADMIN_PASSWORD || crypto.randomBytes(9).toString('base64url'), u = (process.env.ADMIN_USER || 'admin').toLowerCase();
-    await q('INSERT INTO admins(username, pass_hash) VALUES(?, ?)', [u, hashPw(pw)]); console.log('Created admin "' + u + '"' + (process.env.ADMIN_PASSWORD ? '' : ' with temporary password: ' + pw));
+// admin: images
+const sniff = (b) => b[0] === 0xff && b[1] === 0xd8 ? 'jpg' : (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) ? 'png' : (b.slice(0, 4).toString() === 'RIFF' && b.slice(8, 12).toString() === 'WEBP') ? 'webp' : null;
+route('POST', /^\/api\/admin\/upload$/, true, ({ res, body }) => {
+  const m = /^data:image\/[a-z+]+;base64,(.+)$/s.exec(String(body.data || '')); if (!m) throw new HttpError(400, 'Choose an image file.');
+  const buf = Buffer.from(m[1], 'base64'), ext = sniff(buf); if (!ext) throw new HttpError(400, 'Only JPG, PNG or WebP images are allowed.');
+  if (buf.length > 8 * 1024 * 1024) throw new HttpError(413, 'Image is too large (max 8 MB).');
+  const name = crypto.randomBytes(10).toString('hex') + '.' + ext; fs.writeFileSync(path.join(UPLOADS, name), buf);
+  audit('upload', name); J(res, 200, { url: '/uploads/' + name });
+});
+
+// admin: apartments
+const aptFields = (b) => ({
+  name: str(b.name, 120), tagline: str(b.tagline, 120), description: str(b.description, 600), rate: Math.max(0, int(b.rate)), capacity: Math.min(20, Math.max(1, int(b.capacity, 2))),
+  amenities: JSON.stringify((Array.isArray(b.amenities) ? b.amenities : String(b.amenities || '').split(',')).map(x => str(x, 40)).filter(Boolean).slice(0, 20)),
+  photos: JSON.stringify((Array.isArray(b.photos) ? b.photos : []).map(x => str(x, 300)).filter(x => /^\/[A-Za-z0-9._%\-\/]+$/.test(x)).slice(0, 30)), active: b.active === false || b.active === 0 ? 0 : 1
+});
+route('GET', /^\/api\/admin\/apartments$/, true, ({ res }) => J(res, 200, { apartments: all('SELECT * FROM apartments ORDER BY sort,id').map(aptOut) }));
+route('POST', /^\/api\/admin\/apartments$/, true, ({ res, body }) => {
+  const f = aptFields(body); if (!f.name) throw new HttpError(400, 'Enter the apartment name.');
+  if (get('SELECT 1 FROM apartments WHERE name=?', f.name)) throw new HttpError(400, 'An apartment with that name already exists.');
+  const sort = (get('SELECT COALESCE(MAX(sort),0)+1 s FROM apartments').s);
+  const r = run('INSERT INTO apartments(name,tagline,description,rate,capacity,amenities,photos,active,sort) VALUES(?,?,?,?,?,?,?,?,?)', f.name, f.tagline, f.description, f.rate, f.capacity, f.amenities, f.photos, f.active, sort);
+  audit('apartment.add', f.name); J(res, 200, { id: Number(r.lastInsertRowid) });
+});
+route('POST', /^\/api\/admin\/apartments\/(\d+)$/, true, ({ res, body, m }) => {
+  const id = Number(m[1]), cur = get('SELECT * FROM apartments WHERE id=?', id); if (!cur) throw new HttpError(404, 'Not found');
+  const f = aptFields(body); if (!f.name) throw new HttpError(400, 'Enter the apartment name.');
+  if (get('SELECT 1 FROM apartments WHERE name=? AND id<>?', f.name, id)) throw new HttpError(400, 'Another apartment already uses that name.');
+  run('UPDATE apartments SET name=?,tagline=?,description=?,rate=?,capacity=?,amenities=?,photos=?,active=? WHERE id=?', f.name, f.tagline, f.description, f.rate, f.capacity, f.amenities, f.photos, f.active, id);
+  if (cur.name !== f.name) run('UPDATE bookings SET room=? WHERE room=?', f.name, cur.name);
+  audit('apartment.update', f.name); J(res, 200, { ok: true });
+});
+route('POST', /^\/api\/admin\/apartments\/(\d+)\/move$/, true, ({ res, body, m }) => {
+  const id = Number(m[1]), list = all('SELECT id FROM apartments ORDER BY sort,id').map(x => x.id), i = list.indexOf(id), j = i + (body.dir === 'up' ? -1 : 1);
+  if (i < 0 || j < 0 || j >= list.length) return J(res, 200, { ok: true });
+  [list[i], list[j]] = [list[j], list[i]]; list.forEach((x, k) => run('UPDATE apartments SET sort=? WHERE id=?', k, x)); J(res, 200, { ok: true });
+});
+route('POST', /^\/api\/admin\/apartments\/(\d+)\/delete$/, true, ({ res, m }) => { run('DELETE FROM apartments WHERE id=?', Number(m[1])); audit('apartment.delete', m[1]); J(res, 200, { ok: true }); });
+
+// admin: gallery
+route('GET', /^\/api\/admin\/gallery$/, true, ({ res }) => J(res, 200, { gallery: all('SELECT id,url,caption FROM gallery ORDER BY sort,id') }));
+route('POST', /^\/api\/admin\/gallery$/, true, ({ res, body }) => {
+  const url = str(body.url, 300); if (!/^\/[A-Za-z0-9._%\-\/]+$/.test(url)) throw new HttpError(400, 'Upload a photo first.');
+  run('INSERT INTO gallery(url,caption,sort) VALUES(?,?,?)', url, str(body.caption, 120), get('SELECT COALESCE(MAX(sort),0)+1 s FROM gallery').s); J(res, 200, { ok: true });
+});
+route('POST', /^\/api\/admin\/gallery\/(\d+)\/delete$/, true, ({ res, m }) => { run('DELETE FROM gallery WHERE id=?', Number(m[1])); J(res, 200, { ok: true }); });
+
+// admin: bookings
+const STATUSES = ['awaiting_payment', 'confirmed', 'checked_in', 'completed', 'cancelled'];
+const BK_COLS = ['ref', 'created_at', 'name', 'email', 'phone', 'room', 'checkin', 'checkout', 'nights', 'guests', 'rate', 'subtotal', 'caution', 'deposit', 'paid', 'status', 'source', 'message', 'notes'];
+route('GET', /^\/api\/admin\/bookings$/, true, ({ res }) => J(res, 200, { bookings: all('SELECT * FROM bookings ORDER BY created_at DESC, id DESC LIMIT 5000'), rooms: all('SELECT name FROM apartments ORDER BY sort,id').map(a => a.name) }));
+route('GET', /^\/api\/admin\/bookings\.csv$/, true, ({ res }) => {
+  res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="phibs-bookings.csv"', 'Cache-Control': 'no-store' });
+  res.end(toCsv(BK_COLS, all('SELECT * FROM bookings ORDER BY checkin DESC')));
+});
+const bkFields = (b, base) => {
+  const ci = str(b.checkin, 10), co = str(b.checkout, 10);
+  if (!str(b.name, 120) || !isDate(ci) || !isDate(co) || co <= ci) throw new HttpError(400, 'Enter the guest name and valid dates.');
+  const nights = daysBetween(ci, co), rate = int(b.rate, base ? base.rate : 0), subtotal = b.subtotal === '' || b.subtotal == null ? nights * rate : int(b.subtotal);
+  return {
+    name: str(b.name, 120), email: str(b.email, 160), phone: str(b.phone, 40), room: str(b.room, 120), checkin: ci, checkout: co, guests: Math.max(1, int(b.guests, 1)), nights, rate, subtotal,
+    caution: int(b.caution, base ? base.caution : getSite().caution_fee), deposit: int(b.deposit, Math.round(subtotal * getSite().deposit_pct / 100)), paid: Math.max(0, int(b.paid)),
+    status: STATUSES.includes(b.status) ? b.status : 'awaiting_payment', notes: str(b.notes, 1000), message: str(b.message, 1000)
+  };
+};
+route('POST', /^\/api\/admin\/bookings$/, true, ({ res, body }) => {
+  const apt = get('SELECT rate FROM apartments WHERE name=?', str(body.room, 120)); if (apt && (body.rate == null || body.rate === '')) body.rate = apt.rate;
+  const f = bkFields(body); let ref = newRef(); while (get('SELECT 1 FROM bookings WHERE ref=?', ref)) ref = newRef();
+  run('INSERT INTO bookings(ref,name,email,phone,room,checkin,checkout,guests,nights,rate,subtotal,caution,deposit,paid,status,notes,message,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    ref, f.name, f.email, f.phone, f.room, f.checkin, f.checkout, f.guests, f.nights, f.rate, f.subtotal, f.caution, f.deposit, f.paid, f.status, f.notes, f.message, 'added by admin');
+  audit('booking.add', ref); J(res, 200, { ref });
+});
+route('POST', /^\/api\/admin\/bookings\/(\d+)$/, true, ({ res, body, m }) => {
+  const id = Number(m[1]), cur = get('SELECT * FROM bookings WHERE id=?', id); if (!cur) throw new HttpError(404, 'Not found');
+  const f = bkFields({ ...cur, ...body }, cur);
+  run('UPDATE bookings SET name=?,email=?,phone=?,room=?,checkin=?,checkout=?,guests=?,nights=?,rate=?,subtotal=?,caution=?,deposit=?,paid=?,status=?,notes=?,message=? WHERE id=?',
+    f.name, f.email, f.phone, f.room, f.checkin, f.checkout, f.guests, f.nights, f.rate, f.subtotal, f.caution, f.deposit, f.paid, f.status, f.notes, f.message, id);
+  audit('booking.update', cur.ref + ' ' + f.status); J(res, 200, { ok: true });
+});
+route('POST', /^\/api\/admin\/bookings\/(\d+)\/delete$/, true, ({ res, m }) => { const b = get('SELECT ref FROM bookings WHERE id=?', Number(m[1])); run('DELETE FROM bookings WHERE id=?', Number(m[1])); audit('booking.delete', b && b.ref); J(res, 200, { ok: true }); });
+route('GET', /^\/api\/admin\/enquiries$/, true, ({ res }) => J(res, 200, { enquiries: all('SELECT * FROM enquiries ORDER BY id DESC LIMIT 1000') }));
+route('POST', /^\/api\/admin\/enquiries\/(\d+)\/delete$/, true, ({ res, m }) => { run('DELETE FROM enquiries WHERE id=?', Number(m[1])); J(res, 200, { ok: true }); });
+
+// admin: old system records
+route('GET', /^\/api\/admin\/legacy$/, true, ({ res, url }) => {
+  const t = url.searchParams.get('table'), tables = all('SELECT name,cols,row_count FROM legacy_tables ORDER BY name').map(x => ({ ...x, cols: JSON.parse(x.cols) }));
+  if (!t) return J(res, 200, { tables, configured: !!process.env.DATABASE_URL });
+  const info = tables.find(x => x.name === t); if (!info) throw new HttpError(404, 'Table not found');
+  const off = Math.max(0, int(url.searchParams.get('offset'))), q = str(url.searchParams.get('q'), 80).toLowerCase();
+  const where = q ? 'AND lower(data) LIKE ?' : '', args = q ? [t, '%' + q.replace(/[%_]/g, '') + '%'] : [t];
+  const total = get(`SELECT COUNT(*) c FROM legacy_rows WHERE tbl=? ${where}`, ...args).c;
+  J(res, 200, { table: info, total, rows: all(`SELECT id,data FROM legacy_rows WHERE tbl=? ${where} ORDER BY id LIMIT 50 OFFSET ${off}`, ...args).map(r => JSON.parse(r.data)) });
+});
+route('GET', /^\/api\/admin\/legacy\.csv$/, true, ({ res, url }) => {
+  const t = url.searchParams.get('table'), info = get('SELECT cols FROM legacy_tables WHERE name=?', t); if (!info) throw new HttpError(404, 'Table not found');
+  res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="old-${t.replace(/[^a-z0-9_]/gi, '')}.csv"`, 'Cache-Control': 'no-store' });
+  res.end(toCsv(JSON.parse(info.cols), all('SELECT data FROM legacy_rows WHERE tbl=? ORDER BY id', t).map(r => JSON.parse(r.data))));
+});
+route('POST', /^\/api\/admin\/legacy\/import$/, true, async ({ res }) => {
+  const url = process.env.DATABASE_URL; if (!url) throw new HttpError(400, 'DATABASE_URL is not set in Render yet. See the setup steps.');
+  let pg; try { pg = require('pg'); } catch { throw new HttpError(500, 'The "pg" package is not installed. Set the Render build command to: npm install'); }
+  const client = new pg.Client({ connectionString: url, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 15000 });
+  try { await client.connect(); } catch (e) { throw new HttpError(502, 'Could not connect to the old database: ' + String(e.message).slice(0, 160)); }
+  const summary = [];
+  try {
+    const tabs = (await client.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name")).rows.map(r => r.table_name);
+    for (const t of tabs) {
+      const q = await client.query(`SELECT * FROM "${t.replace(/"/g, '""')}" LIMIT 200000`);
+      const cols = q.fields.map(f => f.name), rows = q.rows;
+      db.exec('BEGIN');
+      try {
+        run('DELETE FROM legacy_rows WHERE tbl=?', t); run('INSERT OR REPLACE INTO legacy_tables(name,cols,row_count) VALUES(?,?,?)', t, JSON.stringify(cols), rows.length);
+        const ins = db.prepare('INSERT INTO legacy_rows(tbl,data) VALUES(?,?)');
+        for (const r of rows) ins.run(t, JSON.stringify(r, (k, v) => typeof v === 'bigint' ? v.toString() : v));
+        db.exec('COMMIT');
+      } catch (e) { try { db.exec('ROLLBACK'); } catch {} throw e; }
+      summary.push({ name: t, rows: rows.length });
+    }
+  } catch (e) { throw new HttpError(500, 'Import stopped: ' + String(e.message).slice(0, 200)); } finally { try { await client.end(); } catch {} }
+  audit('legacy.import', summary.map(s => s.name + ':' + s.rows).join(' ')); J(res, 200, { tables: summary });
+});
+const pick = (cols, re) => cols.find(c => re.test(c));
+const normDate = (v) => { if (!v) return ''; const d = new Date(v); return isNaN(d) ? '' : d.toISOString().slice(0, 10); };
+route('POST', /^\/api\/admin\/legacy\/convert$/, true, ({ res, body }) => {
+  const t = str(body.table, 80), info = get('SELECT cols FROM legacy_tables WHERE name=?', t); if (!info) throw new HttpError(404, 'Choose an imported table.');
+  const cols = JSON.parse(info.cols), M = {
+    name: pick(cols, /^(guest_?name|full_?name|customer_?name|name)$/i) || pick(cols, /name/i), email: pick(cols, /e-?mail/i), phone: pick(cols, /phone|mobile|tel/i),
+    room: pick(cols, /^(room|apartment|suite|unit|room_?type|room_?name|apartment_?name)$/i) || pick(cols, /room|apartment|suite/i), ci: pick(cols, /check_?-?in|arrival|start_?date|from_?date/i), co: pick(cols, /check_?-?out|departure|end_?date|to_?date/i),
+    guests: pick(cols, /^(guests?|no_?of_?guests|num(ber)?_?(of_?)?guests|adults|persons|pax|occupants)$/i), total: pick(cols, /total|amount|price|cost/i), paid: pick(cols, /^(paid|amount_?paid|deposit)/i), status: pick(cols, /status/i), created: pick(cols, /created|booked|date_?added/i), id: pick(cols, /^(id|booking_?id|reference|ref)$/i)
+  };
+  if (!M.name || !M.ci || !M.co) throw new HttpError(400, 'This table does not look like bookings (no guest name or dates found). Pick the bookings table.');
+  let added = 0, skipped = 0;
+  const statusMap = (s) => { s = String(s || '').toLowerCase(); return /cancel/.test(s) ? 'cancelled' : /complete|checked.?out|done/.test(s) ? 'completed' : /checked.?in/.test(s) ? 'checked_in' : /confirm|paid|approved/.test(s) ? 'confirmed' : 'awaiting_payment'; };
+  db.exec('BEGIN');
+  try {
+    for (const r of all('SELECT data FROM legacy_rows WHERE tbl=? ORDER BY id', t)) {
+      const d = JSON.parse(r.data), ref = 'OLD-' + String(M.id ? d[M.id] : crypto.randomBytes(3).toString('hex')).replace(/[^A-Za-z0-9\-]/g, '').slice(0, 24);
+      const ci = normDate(d[M.ci]), co = normDate(d[M.co]); if (get('SELECT 1 FROM bookings WHERE ref=?', ref) || !ci || !co || co <= ci) { skipped++; continue; }
+      const nights = Math.max(1, daysBetween(ci, co)), total = M.total ? int(d[M.total]) : 0;
+      run('INSERT INTO bookings(ref,created_at,name,email,phone,room,checkin,checkout,guests,nights,rate,subtotal,caution,deposit,paid,status,message,notes,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        ref, (M.created && d[M.created] && !isNaN(new Date(d[M.created])) ? new Date(d[M.created]).toISOString().slice(0, 19).replace('T', ' ') : new Date().toISOString().slice(0, 19).replace('T', ' ')),
+        str(d[M.name], 120), M.email ? str(d[M.email], 160) : '', M.phone ? str(d[M.phone], 40) : '', M.room ? str(d[M.room], 120) : '', ci, co, M.guests ? Math.max(1, int(d[M.guests], 1)) : 1, nights,
+        Math.round(total / nights), total, 0, 0, M.paid ? int(d[M.paid]) : 0, statusMap(M.status ? d[M.status] : ''), '', 'Imported from the old system', 'old system');
+      added++;
+    }
+    db.exec('COMMIT');
+  } catch (e) { try { db.exec('ROLLBACK'); } catch {} throw new HttpError(500, 'Conversion stopped: ' + String(e.message).slice(0, 160)); }
+  audit('legacy.convert', `${t}: ${added} added, ${skipped} skipped`); J(res, 200, { added, skipped, mapping: M });
+});
+route('POST', /^\/api\/admin\/legacy\/load$/, true, ({ res, body }) => {
+  const list = Array.isArray(body.bookings) ? body.bookings.slice(0, 5000) : null; if (!list) throw new HttpError(400, 'That is not the old bookings file.');
+  const STAT = ['awaiting_payment', 'confirmed', 'checked_in', 'completed', 'cancelled']; let added = 0, skipped = 0;
+  db.exec('BEGIN');
+  try {
+    for (const o of list) {
+      const ref = 'OLD-' + String(o.id || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toUpperCase(), ci = str(o.checkin, 10), co = str(o.checkout, 10);
+      if (ref === 'OLD-' || !isDate(ci) || !isDate(co) || co <= ci || get('SELECT 1 FROM bookings WHERE ref=?', ref)) { skipped++; continue; }
+      const nights = daysBetween(ci, co), rate = Math.max(0, int(o.rate)), sub = o.subtotal != null ? Math.max(0, int(o.subtotal)) : nights * rate;
+      run('INSERT INTO bookings(ref,created_at,name,email,phone,room,checkin,checkout,guests,nights,rate,subtotal,caution,deposit,paid,status,message,notes,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        ref, /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(String(o.created_at)) ? String(o.created_at).slice(0, 19).replace('T', ' ') : new Date().toISOString().slice(0, 19).replace('T', ' '),
+        str(o.name, 120), str(o.email, 160), str(o.phone, 40), str(o.room, 120), ci, co, Math.max(1, int(o.guests, 1)), nights, rate, sub, 0, 0, Math.max(0, int(o.paid)), STAT.includes(o.status) ? o.status : 'confirmed', '', str(o.notes, 400), 'old system');
+      added++;
+    }
+    db.exec('COMMIT');
+  } catch (e) { try { db.exec('ROLLBACK'); } catch {} throw new HttpError(500, 'Import stopped: ' + String(e.message).slice(0, 160)); }
+  audit('legacy.load', added + ' added, ' + skipped + ' skipped'); J(res, 200, { added, skipped });
+});
+route('GET', /^\/api\/admin\/backup$/, true, ({ res }) => {
+  const f = path.join(DATA_DIR, 'backup-tmp.db'); try { fs.unlinkSync(f); } catch {} db.exec(`VACUUM INTO '${f.replace(/'/g, "''")}'`);
+  res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="phibs-backup-${lagosToday()}.db"`, 'Cache-Control': 'no-store' });
+  fs.createReadStream(f).on('close', () => { try { fs.unlinkSync(f); } catch {} }).pipe(res);
+});
+
+/* ---------- static files ---------- */
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
+const PUBLIC_JS = new Set(['admin.js']);
+function serveFile(res, file, cache) {
+  const ext = path.extname(file).toLowerCase(); fs.readFile(file, (err, buf) => {
+    if (err) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
+    const h = { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Cache-Control': cache };
+    if (/^(text|application\/javascript)|svg/.test(MIME[ext] || '') && /gzip/.test(res.req.headers['accept-encoding'] || '') && buf.length > 1024) { h['Content-Encoding'] = 'gzip'; res.writeHead(200, h); return res.end(require('zlib').gzipSync(buf)); }
+    res.writeHead(200, h); res.end(buf);
+  });
+}
+const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://wa.me";
+
+const server = http.createServer(async (req, res) => {
+  res.req = req;
+  res.setHeader('Content-Security-Policy', CSP); res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'same-origin'); res.setHeader('X-Frame-Options', 'DENY');
+  try {
+    const url = new URL(req.url, 'http://x'); let p; try { p = decodeURIComponent(url.pathname); } catch { p = url.pathname; }
+    if (p.startsWith('/api/')) {
+      if (req.method === 'POST') { const o = req.headers.origin; if (o && new URL(o).host !== req.headers.host) throw new HttpError(403, 'Blocked.'); }
+      const r = routes.find(r => r.method === req.method && r.re.test(p)); if (!r) throw new HttpError(404, 'Not found');
+      if (r.auth && !isAdmin(req)) throw new HttpError(401, 'Please log in again.');
+      const body = req.method === 'POST' ? await readBody(req, /admin\/upload$/.test(p) ? 12e6 : 1e6) : {};
+      return await r.fn({ req, res, url, body, m: p.match(r.re) });
+    }
+    if (p.startsWith('/uploads/')) { const n = p.slice(9); if (!/^[a-f0-9]{20}\.(jpg|png|webp)$/.test(n)) throw new HttpError(404, 'Not found'); return serveFile(res, path.join(UPLOADS, n), 'public, max-age=31536000, immutable'); }
+    if (p === '/' ) p = '/index.html'; if (p === '/admin' || p === '/admin/') p = '/admin.html';
+    const name = p.slice(1);
+    if (!name || name.includes('/') || name.startsWith('.')) throw new HttpError(404, 'Not found');
+    const ext = path.extname(name).toLowerCase();
+    if (!MIME[ext] || (ext === '.js' && !PUBLIC_JS.has(name))) throw new HttpError(404, 'Not found');
+    return serveFile(res, path.join(__dirname, name), ext === '.html' || ext === '.js' ? 'no-cache' : 'public, max-age=3600');
+  } catch (e) {
+    if (!res.headersSent) { if (e.status) J(res, e.status, { error: e.message }); else { console.error(e); J(res, 500, { error: 'Something went wrong.' }); } }
   }
-  server.listen(PORT, '0.0.0.0', () => console.log('Phibs site on port ' + PORT + (PG ? ' (Postgres)' : ' (local SQLite)')));
-})().catch(e => { console.error('Startup failed:', e.message); process.exit(1); });
+});
+if (require.main === module) server.listen(PORT, () => console.log('Phibs running on port ' + PORT));
+module.exports = { server };
