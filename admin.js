@@ -82,10 +82,10 @@
   };
 
   /* ---------- bookings ---------- */
-  var BK = { list: [], rooms: [], q: '', st: '' };
+  var BK = { list: [], rooms: [], apts: [], q: '', st: '' };
   VIEWS.bookings = function (el) {
     api('/bookings').then(function (d) {
-      BK.list = d.bookings; BK.rooms = d.rooms; drawBookings(el);
+      BK.list = d.bookings; BK.rooms = d.rooms; BK.apts = d.apts || []; drawBookings(el);
       var ref = sessionStorage.getItem('openRef'); if (ref) { sessionStorage.removeItem('openRef'); var b = BK.list.filter(function (x) { return x.ref === ref; })[0]; if (b) bookingModal(b, el); }
     }).catch(fail);
   };
@@ -102,18 +102,27 @@
     $$('tr.click', el).forEach(function (tr) { tr.onclick = function () { bookingModal(BK.list.filter(function (b) { return b.id === Number(tr.getAttribute('data-id')); })[0], el); }; });
   }
   function bookingModal(b, el) {
-    var isNew = !b; b = b || { name: '', email: '', phone: '', room: BK.rooms[0] || '', checkin: '', checkout: '', guests: 2, rate: '', subtotal: '', caution: 50000, deposit: '', paid: 0, status: 'confirmed', notes: '', message: '' };
+    var isNew = !b; b = b || { name: '', email: '', phone: '', room: BK.rooms[0] || '', checkin: '', checkout: '', guests: 2, rate: '', subtotal: '', caution: '', deposit: '', paid: 0, status: 'confirmed', notes: '', message: '' };
     var m = modal('<h2>' + (isNew ? 'Add booking' : esc(b.ref)) + '</h2>' + (isNew ? '' : '<p class="muted">Booked ' + esc((b.created_at || '').slice(0, 16)) + (b.message ? ' &middot; Guest note: ' + esc(b.message) : '') + '</p>') +
-      '<form id="bf"><div class="grid g2"><div class="field"><label>Guest name</label><input name="name" value="' + esc(b.name) + '" required></div><div class="field"><label>Phone</label><input name="phone" value="' + esc(b.phone) + '"></div></div>' +
-      '<div class="grid g2"><div class="field"><label>Email</label><input name="email" value="' + esc(b.email) + '"></div><div class="field"><label>Apartment</label><select name="room">' + (BK.rooms.indexOf(b.room) < 0 && b.room ? '<option>' + esc(b.room) + '</option>' : '') + BK.rooms.map(function (r) { return '<option' + (r === b.room ? ' selected' : '') + '>' + esc(r) + '</option>'; }).join('') + '</select></div></div>' +
+      '<form id="bf"><div class="grid g2"><div class="field"><label>Guest name</label><input name="name" value="' + esc(b.name) + '" required></div>' + (ME.role !== 'admin' && !isNew ? '' : '<div class="field"><label>Phone</label><input name="phone" value="' + esc(b.phone) + '"></div>') + '</div>' +
+      '<div class="grid g2">' + (ME.role !== 'admin' && !isNew ? '' : '<div class="field"><label>Email</label><input name="email" value="' + esc(b.email) + '"></div>') + '<div class="field"><label>Apartment</label><select name="room">' + (BK.rooms.indexOf(b.room) < 0 && b.room ? '<option>' + esc(b.room) + '</option>' : '') + BK.rooms.map(function (r) { return '<option' + (r === b.room ? ' selected' : '') + '>' + esc(r) + '</option>'; }).join('') + '</select></div></div>' +
       '<div class="grid g3"><div class="field"><label>Check-in</label><input type="date" name="checkin" value="' + esc(b.checkin) + '" required></div><div class="field"><label>Check-out</label><input type="date" name="checkout" value="' + esc(b.checkout) + '" required></div><div class="field"><label>Guests</label><input name="guests" inputmode="numeric" value="' + esc(b.guests) + '"></div></div>' +
-      '<div class="grid g3"><div class="field"><label>Stay total (₦)</label><input name="subtotal" inputmode="numeric" value="' + esc(b.subtotal) + '" placeholder="Auto from rate"></div><div class="field"><label>Caution fee (₦)</label><input name="caution" inputmode="numeric" value="' + esc(b.caution) + '"></div>' + (isNew ? '<div class="field"><label>Amount paid now (₦)</label><input name="paid" inputmode="numeric" value="0"></div>' : '<div class="field"><label>Paid so far</label><input value="' + naira(b.paid) + '" disabled></div>') + '</div>' +
+      '<div class="grid g3"><div class="field"><label>Rate per night (₦)</label><input name="rate" inputmode="numeric" value="' + esc(b.rate) + '"></div><div class="field"><label>Stay total (₦) <span class="muted" id="nt"></span></label><input name="subtotal" inputmode="numeric" value="' + esc(b.subtotal) + '"></div><div class="field"><label>Caution fee (₦)</label><input name="caution" inputmode="numeric" value="' + esc(b.caution) + '"><p class="muted" style="margin:4px 0 0">Change it, or enter 0 to waive it.</p></div></div>' +
+      (isNew ? '<div class="grid g3"><div class="field"><label>Amount paid now (₦)</label><input name="paid" inputmode="numeric" value="0"></div></div>' : '<div class="grid g3"><div class="field"><label>Paid so far</label><input value="' + naira(b.paid) + '" disabled></div></div>') +
       '<div class="grid g2"><div class="field"><label>Status</label><select name="status">' + Object.keys(STATUS).map(function (s) { return '<option value="' + s + '"' + (b.status === s ? ' selected' : '') + '>' + STATUS[s] + '</option>'; }).join('') + '</select></div><div class="field"><label>Private notes</label><input name="notes" value="' + esc(b.notes) + '" placeholder="Only visible here"></div></div>' +
       '<div class="err" id="be"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn">' + (isNew ? 'Save booking' : 'Save changes') + '</button>' +
       (isNew ? '' : (b.phone ? '<a class="btn ghost" target="_blank" rel="noopener" href="https://wa.me/' + esc(String(b.phone).replace(/[^0-9]/g, '').replace(/^0/, '234')) + '">WhatsApp guest</a>' : '') + (ME.role === 'admin' ? '<button type="button" class="btn red" id="del" style="margin-left:auto">Delete</button>' : '')) + '</div></form>' + (isNew ? '' : '<div id="paybox" class="card" style="margin:18px 0 0;background:#faf8f3"><p class="muted">Loading payments...</p></div>'));
+    var fv = function (n) { return $('[name=' + n + ']', m); }, subTouched = false, aptOf = function (n) { return BK.apts.filter(function (x) { return x.name === n; })[0]; };
+    var nightsOf = function () { var x = fv('checkin').value, y = fv('checkout').value; var n = x && y ? Math.round((Date.parse(y) - Date.parse(x)) / 864e5) : 0; return n > 0 ? n : 0; };
+    var recalc = function () { var n = nightsOf(); $('#nt', m).textContent = n ? '(' + n + ' night' + (n === 1 ? '' : 's') + ')' : ''; if (!subTouched) fv('subtotal').value = n ? n * num(fv('rate').value) : ''; };
+    fv('subtotal').oninput = function () { subTouched = true; };
+    fv('room').onchange = function () { var x = aptOf(this.value); if (x) { fv('rate').value = x.rate; fv('caution').value = x.caution; subTouched = false; recalc(); } };
+    fv('rate').oninput = function () { subTouched = false; recalc(); };
+    fv('checkin').onchange = fv('checkout').onchange = function () { subTouched = false; recalc(); };
+    if (isNew) { var a0 = aptOf(fv('room').value); if (a0) { fv('rate').value = a0.rate; fv('caution').value = a0.caution; } }
+    recalc(); if (!isNew) fv('subtotal').value = b.subtotal;
     $('#bf', m).onsubmit = function (e) {
-      e.preventDefault(); var f = {}; $$('[name]', m).forEach(function (i) { f[i.name] = i.value; });
-      if (!isNew) { f.rate = b.rate; if (String(f.subtotal) === String(b.subtotal) && (f.checkin !== b.checkin || f.checkout !== b.checkout)) f.subtotal = ''; }
+      e.preventDefault(); var f = {}; $$('[name]', m).forEach(function (i) { f[i.name] = i.value; }); f.deposit = '';
       var send = function (extra) { return api(isNew ? '/bookings' : '/bookings/' + b.id, Object.assign({}, f, extra || {})); };
       send().catch(function (er) { if (er.clash && ME.role === 'admin' && confirm(er.message + '\n\nSave it anyway?')) return send({ force: true }); throw er; })
         .then(function (res) {
@@ -131,7 +140,7 @@
   /* ---------- reservations ---------- */
   VIEWS.reservations = function (el) {
     api('/bookings').then(function (d) {
-      BK.list = d.bookings; BK.rooms = d.rooms;
+      BK.list = d.bookings; BK.rooms = d.rooms; BK.apts = d.apts || [];
       var rows = BK.list.filter(function (b) { return b.status === 'confirmed'; }).sort(function (x, y) { return x.checkin < y.checkin ? -1 : x.checkin > y.checkin ? 1 : 0; });
       el.innerHTML = '<div class="head"><h1>Reservations</h1></div><p class="muted" style="margin-top:-6px">Confirmed bookings waiting for check-in. A payment receipt is issued as soon as a booking becomes a reservation.</p>' +
         '<div class="card scroll"><table><thead><tr><th>Reference</th><th>Guest</th><th>Apartment</th><th>Stay</th><th class="num">Paid</th><th class="num">Balance</th><th></th></tr></thead><tbody>' +
@@ -171,14 +180,15 @@
     var row = function (k, v) { return '<tr><td>' + k + '</td><td class="r">' + v + '</td></tr>'; };
     var pays = (d.carried > 0 ? '<tr><td>Earlier payment</td><td>-</td><td class="r">' + naira(d.carried) + '</td></tr>' : '') + d.payments.map(function (p) { return '<tr><td>' + fdt(p.created_at) + '</td><td>' + esc(p.method) + (p.note ? ' (' + esc(p.note) + ')' : '') + '</td><td class="r">' + naira(p.amount) + '</td></tr>'; }).join('');
     var el = document.createElement('div'); el.id = 'rcpt';
+    var sig = last ? (last.by_user || last.by_name) : '', kv = function (k, v) { return '<div><small>' + k + '</small><b>' + v + '</b></div>'; };
     el.innerHTML = '<div class="rc-bar"><button class="btn" id="rcPrint">Print receipt</button><button class="btn ghost" id="rcClose">Close</button></div>' +
-      '<div class="rc-paper"><div class="rc-head"><img src="phibs-logo.png" alt="Phibs Luxury Homes"><div class="rc-co"><b>Phibs Luxury Homes</b><br>' + esc(S.city || 'Abuja') + ', Nigeria &middot; ' + esc(S.rc || '') + '<br>' + esc(S.address || '') + '<br>' + esc(S.phone1 || '') + (S.phone2 ? ' / ' + esc(S.phone2) : '') + '<br>' + esc(S.email || '') + '</div></div>' +
-      '<h1>Payment receipt</h1><table class="rc-meta"><tr><td>Receipt no.</td><td class="r"><b>' + esc(bk.ref) + '</b></td></tr><tr><td>Date issued</td><td class="r">' + issued + '</td></tr></table>' +
-      '<h4>Guest and stay</h4><table class="rc-t">' + row('Guest', esc(bk.name)) + (bk.phone ? row('Phone', esc(bk.phone)) : '') + row('Apartment', esc(bk.room)) + row('Check-in', fdate(bk.checkin)) + row('Check-out', fdate(bk.checkout)) + row('Nights', bk.nights) + row('Rate per night', naira(bk.rate)) + '</table>' +
-      '<h4>Payments received</h4><table class="rc-t rc-p"><thead><tr><th>Date</th><th>Method</th><th class="r">Amount</th></tr></thead><tbody>' + (pays || '<tr><td colspan="3">No payment yet</td></tr>') + '</tbody></table>' +
-      '<table class="rc-t rc-sum">' + row('Stay total', naira(bk.subtotal)) + row('Refundable caution fee', naira(bk.caution)) + row('Total due', naira(due)) + row('Total paid', '<b>' + naira(bk.paid) + '</b>') + row('Balance', '<b>' + naira(bal) + '</b>') + '</table>' +
-      '<div class="rc-stamp ' + (bal ? 'part' : 'full') + '">' + (bal ? 'PART PAYMENT' : 'PAID IN FULL') + '</div>' +
-      '<p class="rc-foot">' + (last ? 'Received by ' + esc(last.by_name) + '. ' : '') + 'The caution fee is refundable after checkout, subject to our booking policy. Thank you for choosing Phibs Luxury Homes.</p></div>';
+      '<div class="rc-paper' + (d.payments.length > 4 ? ' tight' : '') + '"><div class="rc-head"><img src="phibs-logo.png" alt="Phibs Luxury Homes"><div class="rc-co"><b>Phibs Luxury Homes</b><br>' + esc(S.address || '') + '<br>' + esc(S.city || 'Abuja') + ', Nigeria &middot; ' + esc(S.rc || '') + '<br>' + esc(S.phone1 || '') + (S.phone2 ? ' / ' + esc(S.phone2) : '') + '<br>' + esc(S.email || '') + '</div></div>' +
+      '<div class="rc-title"><h1>Payment receipt</h1><div class="rc-no"><small>Receipt no.</small><b>' + esc(bk.ref) + '</b><small>' + issued + '</small></div></div>' +
+      '<div class="rc-grid">' + kv('Guest', esc(bk.name)) + kv('Apartment', esc(bk.room)) + kv('Check-in', fdate(bk.checkin)) + kv('Check-out', fdate(bk.checkout)) + kv('Nights', bk.nights) + kv('Rate per night', naira(bk.rate)) + '</div>' +
+      '<table class="rc-t rc-p"><thead><tr><th>Payment date</th><th>Method</th><th class="r">Amount</th></tr></thead><tbody>' + (pays || '<tr><td colspan="3">No payment yet</td></tr>') + '</tbody></table>' +
+      '<table class="rc-t rc-sum">' + row('Stay total', naira(bk.subtotal)) + row('Refundable caution fee', bk.caution ? naira(bk.caution) : 'Waived') + row('Total due', naira(due)) + row('Total paid', '<b>' + naira(bk.paid) + '</b>') + row('Balance', '<b>' + naira(bal) + '</b>') + '</table>' +
+      '<div class="rc-sign"><div class="rc-stamp ' + (bal ? 'part' : 'full') + '">' + (bal ? 'PART PAYMENT' : 'PAID IN FULL') + '</div><div class="rc-sigbox"><div class="rc-sig">' + esc(sig) + '</div><div class="rc-line"></div><small>Staff signature' + (last && last.by_name && last.by_name !== sig ? ' &middot; ' + esc(last.by_name) : '') + '</small></div></div>' +
+      '<p class="rc-foot">The caution fee is refundable after checkout, subject to our booking policy. Thank you for choosing Phibs Luxury Homes.</p></div>';
     document.body.appendChild(el); document.body.classList.add('printing'); var oldTitle = document.title; document.title = bk.ref;
     var close = function () { el.remove(); document.body.classList.remove('printing'); document.title = oldTitle; };
     $('#rcClose', el).onclick = close; $('#rcPrint', el).onclick = function () { window.print(); };
@@ -233,6 +243,7 @@
     var photos = a.photos.slice(), m = modal('<h2>' + (isNew ? 'Add apartment' : 'Edit ' + esc(a.name)) + '</h2><form id="af"><div class="grid g2"><div class="field"><label>Name</label><input name="name" value="' + esc(a.name) + '" required></div><div class="field"><label>Short tag (shown on the photo)</label><input name="tagline" value="' + esc(a.tagline) + '" placeholder="e.g. Premium stay"></div></div>' +
       '<div class="field"><label>Description</label><textarea name="description">' + esc(a.description) + '</textarea></div>' +
       '<div class="grid g3"><div class="field"><label>Price per night (₦)</label><input name="rate" inputmode="numeric" value="' + esc(a.rate) + '" required></div><div class="field"><label>Sleeps (guests)</label><input name="capacity" inputmode="numeric" value="' + esc(a.capacity) + '"></div><div class="field"><label>Show on website</label><select name="active"><option value="1"' + (a.active ? ' selected' : '') + '>Yes</option><option value="0"' + (a.active ? '' : ' selected') + '>No (hidden)</option></select></div></div>' +
+      '<div class="field"><label>Caution fee for this apartment (₦)</label><input name="caution" inputmode="numeric" value="' + esc(a.caution == null ? '' : a.caution) + '" placeholder="Leave empty to use the standard fee"><p class="muted" style="margin:4px 0 0">Used for new bookings. Staff can still change or waive it on any booking.</p></div>' +
       '<div class="field"><label>How many of this apartment do you have?</label><input name="units" inputmode="numeric" value="' + esc(a.units || 1) + '"><p class="muted" style="margin:4px 0 0">Normally 1. Guests can book it until every unit is taken for their dates.</p></div>' +
       '<div class="field"><label>Amenities (separate with commas)</label><input name="amenities" value="' + esc(a.amenities.join(', ')) + '"></div>' +
       '<div class="field"><label>Photos (the first one is the cover)</label><div class="photos" id="ph"></div><p><button type="button" class="btn ghost sm" id="up">+ Add photos</button> <span class="muted" id="upn"></span></p></div>' +
