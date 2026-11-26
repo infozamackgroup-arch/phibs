@@ -386,9 +386,9 @@ route('POST', /^\/api\/admin\/legacy\/convert$/, 'admin', ({ res, body }) => {
     room: pick(cols, /^(room|apartment|suite|unit|room_?type|room_?name|apartment_?name)$/i) || pick(cols, /room|apartment|suite/i), ci: pick(cols, /check_?-?in|arrival|start_?date|from_?date/i), co: pick(cols, /check_?-?out|departure|end_?date|to_?date/i),
     guests: pick(cols, /^(guests?|no_?of_?guests|num(ber)?_?(of_?)?guests|adults|persons|pax|occupants)$/i), total: pick(cols, /total|amount|price|cost/i), paid: pick(cols, /^(paid|amount_?paid|deposit)/i), status: pick(cols, /status/i), created: pick(cols, /created|booked|date_?added/i), id: pick(cols, /^(id|booking_?id|reference|ref)$/i)
   };
-  const gTab = all('SELECT name,cols FROM legacy_tables').find(x => /^guests?$/i.test(x.name)), gIdCol = pick(cols, /^guest_?id$/i);
+  const gTab = all('SELECT name,cols FROM legacy_tables').find(x => /^guests?$/i.test(x.name)) || all('SELECT name,cols FROM legacy_tables').find(x => /guest|customer/i.test(x.name) && !/folio|invoice|payment|reserv|booking/i.test(x.name)), gIdCol = pick(cols, /^(guest|customer)_?id$/i) || pick(cols, /^(guest|customer)$/i) || pick(cols, /(guest|customer).*id/i);
   if (!M.name && M.ci && M.co && gIdCol && gTab) return J(res, 200, convertReservations(t, cols, M, gIdCol, gTab));
-  if (!M.name || !M.ci || !M.co) throw new HttpError(400, 'This table does not look like bookings (no guest name or dates found). Pick the bookings table.');
+  if (!M.name || !M.ci || !M.co) throw new HttpError(400, 'The "' + t + '" table could not be turned into bookings' + (M.ci && M.co ? ' (it has dates but no guest name, and no Guest table was found)' : ' (no check-in and check-out dates found)') + '. Use the Reservation table. Columns in "' + t + '": ' + cols.join(', ').slice(0, 300));
   let added = 0, skipped = 0;
   const statusMap = (s) => { s = String(s || '').toLowerCase(); return /cancel/.test(s) ? 'cancelled' : /complete|checked.?out|done/.test(s) ? 'completed' : /checked.?in/.test(s) ? 'checked_in' : /confirm|paid|approved/.test(s) ? 'confirmed' : 'awaiting_payment'; };
   db.exec('BEGIN');
@@ -440,7 +440,7 @@ route('POST', /^\/api\/admin\/bookings\/(\d+)\/payments$/, true, ({ res, body, m
   const id = Number(m[1]), b = get('SELECT * FROM bookings WHERE id=?', id); if (!b) throw new HttpError(404, 'Not found');
   const amount = int(body.amount); if (amount <= 0 || amount > 2e9) throw new HttpError(400, 'Enter the amount received.');
   run('INSERT INTO payments(booking_id,amount,method,note,by_name,by_user,created_at) VALUES(?,?,?,?,?,?,?)', id, amount, METHODS.includes(body.method) ? body.method : 'Transfer', str(body.note, 200), w.name, w.username || 'admin', nowLagos());
-  const paid = b.paid + amount, need = Math.max(1, (b.deposit || 0) + (b.caution || 0)), status = b.status === 'awaiting_payment' && paid >= need ? 'confirmed' : b.status;
+  const paid = b.paid + amount, need = Math.max(1, b.deposit || 0), status = b.status === 'awaiting_payment' && paid >= need ? 'confirmed' : b.status;
   run('UPDATE bookings SET paid=?,status=? WHERE id=?', paid, status, id); audit('payment.add', b.ref + ' ' + amount + ' by ' + w.name);
   J(res, 200, payInfo(id, w));
 });
