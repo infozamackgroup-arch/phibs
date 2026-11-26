@@ -53,7 +53,7 @@
 
   /* ---------- shell ---------- */
   var ME = { role: 'admin', name: 'Admin' };
-  var ALL_TABS = [['dash', 'Dashboard'], ['bookings', 'Bookings'], ['reservations', 'Reservations'], ['apartments', 'Apartments'], ['site', 'Website text'], ['gallery', 'Gallery'], ['enquiries', 'Enquiries'], ['staff', 'Staff'], ['old', 'Old records'], ['account', 'Account']];
+  var ALL_TABS = [['dash', 'Dashboard'], ['bookings', 'Bookings'], ['reservations', 'Reservations'], ['payments', 'Payments'], ['apartments', 'Apartments'], ['site', 'Website text'], ['gallery', 'Gallery'], ['enquiries', 'Enquiries'], ['staff', 'Staff'], ['old', 'Old records'], ['account', 'Account']];
   var tabs = function () { return ME.role === 'admin' ? ALL_TABS : ALL_TABS.filter(function (t) { return ['dash', 'bookings', 'reservations', 'enquiries'].indexOf(t[0]) >= 0; }); };
   function shell(active) {
     $('#app').innerHTML = '<header><div class="bar"><img src="phibs-logo.png" alt=""><b>' + (ME.role === 'admin' ? 'Admin' : esc(ME.name) + ' <span style="font-weight:400;font-size:13px;opacity:.8">(staff)</span>') + '</b><a class="btn ghost sm" href="/" target="_blank" rel="noopener" style="color:#fff;background:transparent;border-color:rgba(255,255,255,.4)">View website</a><button id="lo">Log out</button></div><nav><div>' +
@@ -172,17 +172,36 @@
     var pays = (d.carried > 0 ? '<tr><td>Earlier payment</td><td>-</td><td class="r">' + naira(d.carried) + '</td></tr>' : '') + d.payments.map(function (p) { return '<tr><td>' + fdt(p.created_at) + '</td><td>' + esc(p.method) + (p.note ? ' (' + esc(p.note) + ')' : '') + '</td><td class="r">' + naira(p.amount) + '</td></tr>'; }).join('');
     var el = document.createElement('div'); el.id = 'rcpt';
     el.innerHTML = '<div class="rc-bar"><button class="btn" id="rcPrint">Print receipt</button><button class="btn ghost" id="rcClose">Close</button></div>' +
-      '<div class="rc-paper"><div class="rc-head"><img src="phibs-logo.png" alt="Phibs Luxury Homes"><div class="rc-co"><b>Phibs Luxury Homes</b><br>' + esc(S.city || 'Abuja') + ', Nigeria &middot; ' + esc(S.rc || '') + '<br>' + esc(S.phone1 || '') + (S.phone2 ? ' / ' + esc(S.phone2) : '') + '<br>' + esc(S.email || '') + '</div></div>' +
+      '<div class="rc-paper"><div class="rc-head"><img src="phibs-logo.png" alt="Phibs Luxury Homes"><div class="rc-co"><b>Phibs Luxury Homes</b><br>' + esc(S.city || 'Abuja') + ', Nigeria &middot; ' + esc(S.rc || '') + '<br>' + esc(S.address || '') + '<br>' + esc(S.phone1 || '') + (S.phone2 ? ' / ' + esc(S.phone2) : '') + '<br>' + esc(S.email || '') + '</div></div>' +
       '<h1>Payment receipt</h1><table class="rc-meta"><tr><td>Receipt no.</td><td class="r"><b>' + esc(bk.ref) + '</b></td></tr><tr><td>Date issued</td><td class="r">' + issued + '</td></tr></table>' +
       '<h4>Guest and stay</h4><table class="rc-t">' + row('Guest', esc(bk.name)) + (bk.phone ? row('Phone', esc(bk.phone)) : '') + row('Apartment', esc(bk.room)) + row('Check-in', fdate(bk.checkin)) + row('Check-out', fdate(bk.checkout)) + row('Nights', bk.nights) + row('Rate per night', naira(bk.rate)) + '</table>' +
       '<h4>Payments received</h4><table class="rc-t rc-p"><thead><tr><th>Date</th><th>Method</th><th class="r">Amount</th></tr></thead><tbody>' + (pays || '<tr><td colspan="3">No payment yet</td></tr>') + '</tbody></table>' +
       '<table class="rc-t rc-sum">' + row('Stay total', naira(bk.subtotal)) + row('Refundable caution fee', naira(bk.caution)) + row('Total due', naira(due)) + row('Total paid', '<b>' + naira(bk.paid) + '</b>') + row('Balance', '<b>' + naira(bal) + '</b>') + '</table>' +
       '<div class="rc-stamp ' + (bal ? 'part' : 'full') + '">' + (bal ? 'PART PAYMENT' : 'PAID IN FULL') + '</div>' +
       '<p class="rc-foot">' + (last ? 'Received by ' + esc(last.by_name) + '. ' : '') + 'The caution fee is refundable after checkout, subject to our booking policy. Thank you for choosing Phibs Luxury Homes.</p></div>';
-    document.body.appendChild(el); document.body.classList.add('printing');
-    var close = function () { el.remove(); document.body.classList.remove('printing'); };
+    document.body.appendChild(el); document.body.classList.add('printing'); var oldTitle = document.title; document.title = bk.ref;
+    var close = function () { el.remove(); document.body.classList.remove('printing'); document.title = oldTitle; };
     $('#rcClose', el).onclick = close; $('#rcPrint', el).onclick = function () { window.print(); };
   }
+
+  /* ---------- payment summary ---------- */
+  var PS = { view: 'daily', date: '' };
+  VIEWS.payments = function (el) {
+    api('/payments/summary?view=' + PS.view + '&date=' + PS.date).then(function (d) {
+      var fd = function (s) { return fdate(s).replace(/,/g, ''); }, label = d.view === 'daily' ? fd(d.from) : d.view === 'weekly' ? fd(d.from) + ' to ' + fd(d.to) : new Date(d.from + 'T00:00:00').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+      var meth = Object.keys(d.byMethod);
+      el.innerHTML = '<div class="head"><h1>Payments</h1><div style="display:flex;gap:6px;flex-wrap:wrap">' + [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly']].map(function (v) { return '<button class="btn sm ' + (PS.view === v[0] ? '' : 'ghost') + '" data-v="' + v[0] + '">' + v[1] + '</button>'; }).join('') + '</div></div>' +
+        '<div class="card" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn ghost sm" id="pp">&larr; Previous</button><b style="flex:1;text-align:center;min-width:180px">' + label + '</b><button class="btn ghost sm" id="pn">Next &rarr;</button><input type="date" id="pd" value="' + d.from + '" style="width:auto"><button class="btn ghost sm" id="pt">Today</button></div>' +
+        '<div class="grid g4"><div class="stat"><small>Total received</small><b>' + naira(d.total) + '</b></div><div class="stat"><small>Payments</small><b>' + d.count + '</b></div>' +
+        meth.slice(0, 2).map(function (k) { return '<div class="stat"><small>' + esc(k) + '</small><b>' + naira(d.byMethod[k]) + '</b></div>'; }).join('') + '</div><div style="height:16px"></div>' +
+        (d.view === 'daily' ? '' : '<div class="card scroll"><h3 style="margin-bottom:8px">Day by day</h3><table><thead><tr><th>Day</th><th class="num">Payments</th><th class="num">Total</th></tr></thead><tbody>' + d.days.map(function (x) { return '<tr><td>' + fd(x.date) + '</td><td class="num">' + x.count + '</td><td class="num">' + (x.total ? '<b>' + naira(x.total) + '</b>' : '-') + '</td></tr>'; }).join('') + '<tr><td><b>Total</b></td><td class="num"><b>' + d.count + '</b></td><td class="num"><b>' + naira(d.total) + '</b></td></tr></tbody></table></div>') +
+        '<div class="card scroll"><h3 style="margin-bottom:8px">Payments received</h3><table><thead><tr><th>Time</th><th>Receipt no. and guest</th><th>Method</th><th>Received by</th><th class="num">Amount</th></tr></thead><tbody>' +
+        (d.payments.length ? d.payments.map(function (p) { return '<tr><td>' + fdt(p.created_at) + '</td><td><b>' + esc(p.ref) + '</b> ' + esc(p.name) + '<div class="muted">' + esc(p.room) + (p.status === 'cancelled' ? ' &middot; booking cancelled' : '') + '</div></td><td>' + esc(p.method) + '</td><td>' + esc(p.by_name || '-') + '</td><td class="num">' + naira(p.amount) + '</td></tr>'; }).join('') : '<tr><td colspan="5" class="muted">No payments in this period.</td></tr>') + '</tbody></table></div>';
+      var go = function (dt) { PS.date = dt; VIEWS.payments(el); };
+      $$('[data-v]', el).forEach(function (b) { b.onclick = function () { PS.view = b.getAttribute('data-v'); PS.date = d.from; VIEWS.payments(el); }; });
+      $('#pp').onclick = function () { go(d.prev); }; $('#pn').onclick = function () { go(d.next); }; $('#pt').onclick = function () { go(''); }; $('#pd').onchange = function () { if (this.value) go(this.value); };
+    }).catch(fail);
+  };
 
   /* ---------- staff ---------- */
   VIEWS.staff = function (el) {
@@ -234,7 +253,8 @@
 
   /* ---------- website text ---------- */
   var FIELDS = [
-    ['Contact', [['phone1', 'Business phone (also used for WhatsApp)'], ['phone2', 'Second phone'], ['whatsapp', 'WhatsApp number (digits only, with country code)'], ['email', 'Email'], ['instagram', 'Instagram'], ['city', 'City'], ['rc', 'Company registration number'], ['incorporated', 'Incorporated']]],
+    ['Contact', [['phone1', 'Business phone (also used for WhatsApp)'], ['address', 'Business address'], ['phone2', 'Second phone'], ['whatsapp', 'WhatsApp number (digits only, with country code)'], ['email', 'Email'], ['instagram', 'Instagram'], ['city', 'City'], ['rc', 'Company registration number'], ['incorporated', 'Incorporated']]],
+    ['Booking page', [['booking_image:i', 'Background photo at the top of the booking page']]],
     ['Bookings', [['caution_fee', 'Caution fee (₦)'], ['deposit_pct', 'Deposit to confirm (% of stay)']]],
     ['Home page', [['hero_title', 'Main headline'], ['hero_text:t', 'Intro text under the headline']]],
     ['About us', [['about_title', 'Heading'], ['about_p1:t', 'Paragraph 1'], ['about_p2:t', 'Paragraph 2'], ['about_image:i', 'About photo']]],
