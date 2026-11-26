@@ -45,6 +45,7 @@ const AMEN = ['Wifi', 'TV', 'Minibar', 'Balcony', 'Pool', 'Driver'];
 const DEFAULT_SITE = {
   phone1: '+234 916 233 0835', phone2: '+234 816 640 4939', whatsapp: '2349162330835', email: 'info@phibluxuryhomes.com',
   instagram: '@phibs_luxury_homess', rc: 'RC9372447', city: 'Abuja', incorporated: 'June 2022',
+  address: '548, Cluster 5, River Park Estate, Lugbe, FCT', booking_image: '/phibs-lounge.jpg',
   caution_fee: 50000, deposit_pct: 50,
   hero_title: 'Your home away from home in Abuja.',
   hero_text: 'Furnished shortlet apartments in Abuja where you can unwind, recharge and feel at home, with the space and privacy of your own place.',
@@ -404,6 +405,26 @@ route('POST', /^\/api\/admin\/bookings\/(\d+)\/payments$/, true, ({ res, body, m
 route('POST', /^\/api\/admin\/payments\/(\d+)\/delete$/, 'admin', ({ res, m }) => {
   const p = get('SELECT * FROM payments WHERE id=?', Number(m[1])); if (!p) throw new HttpError(404, 'Not found');
   run('DELETE FROM payments WHERE id=?', p.id); run('UPDATE bookings SET paid=MAX(0,paid-?) WHERE id=?', p.amount, p.booking_id); audit('payment.delete', p.booking_id + ' ' + p.amount); J(res, 200, payInfo(p.booking_id));
+});
+
+/* ---------- payment summary (admin only) ---------- */
+const payEvents = () => {
+  const ev = all('SELECT p.id,p.amount,p.method,p.note,p.by_name,p.created_at,b.ref,b.name,b.room,b.status FROM payments p JOIN bookings b ON b.id=p.booking_id');
+  for (const b of all('SELECT b.*, COALESCE((SELECT SUM(amount) FROM payments WHERE booking_id=b.id),0) s FROM bookings b')) if (b.paid > b.s) ev.push({ id: null, amount: b.paid - b.s, method: 'Old system', note: '', by_name: '', created_at: b.created_at, ref: b.ref, name: b.name, room: b.room, status: b.status });
+  return ev.map(e => ({ ...e, day: String(e.created_at).slice(0, 10) }));
+};
+route('GET', /^\/api\/admin\/payments\/summary$/, 'admin', ({ res, url }) => {
+  const q = url.searchParams.get('view'), view = ['daily', 'weekly', 'monthly'].includes(q) ? q : 'daily';
+  let d = str(url.searchParams.get('date'), 10); if (!isDate(d)) d = lagosToday();
+  const Y = Number(d.slice(0, 4)), M = Number(d.slice(5, 7)), iso = (x) => x.toISOString().slice(0, 10); let from, to, prev, next;
+  if (view === 'daily') { from = to = d; prev = addDays(d, -1); next = addDays(d, 1); }
+  else if (view === 'weekly') { const dow = (new Date(d + 'T00:00:00Z').getUTCDay() + 6) % 7; from = addDays(d, -dow); to = addDays(from, 6); prev = addDays(from, -7); next = addDays(from, 7); }
+  else { from = iso(new Date(Date.UTC(Y, M - 1, 1))); to = iso(new Date(Date.UTC(Y, M, 0))); prev = iso(new Date(Date.UTC(Y, M - 2, 1))); next = iso(new Date(Date.UTC(Y, M, 1))); }
+  const rows = payEvents().filter(e => e.day >= from && e.day <= to).sort((a, b) => a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0);
+  const byMethod = {}, byDay = {}; let total = 0;
+  for (const e of rows) { total += e.amount; byMethod[e.method] = (byMethod[e.method] || 0) + e.amount; (byDay[e.day] = byDay[e.day] || { total: 0, count: 0 }); byDay[e.day].total += e.amount; byDay[e.day].count++; }
+  const days = []; for (let x = from; x <= to; x = addDays(x, 1)) days.push({ date: x, total: (byDay[x] || { total: 0 }).total, count: (byDay[x] || { count: 0 }).count });
+  J(res, 200, { view, from, to, prev, next, total, count: rows.length, byMethod, days, payments: rows.slice(0, 500) });
 });
 
 /* ---------- staff accounts (admin only) ---------- */
