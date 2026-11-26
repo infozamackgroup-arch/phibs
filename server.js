@@ -32,6 +32,7 @@ CREATE INDEX IF NOT EXISTS legacy_tbl ON legacy_rows(tbl);
 CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, name TEXT NOT NULL, hash TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')));
 CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id INTEGER NOT NULL, amount INTEGER NOT NULL, method TEXT DEFAULT 'Transfer', note TEXT DEFAULT '', by_name TEXT DEFAULT '', created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS pay_bk ON payments(booking_id);
+CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, apartment TEXT DEFAULT '', rating INTEGER NOT NULL, comment TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', verified INTEGER DEFAULT 0, source TEXT DEFAULT 'guest', created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT DEFAULT (datetime('now')), action TEXT, detail TEXT);
 `);
 try { db.exec('ALTER TABLE apartments ADD COLUMN units INTEGER DEFAULT 1'); } catch {}
@@ -165,6 +166,37 @@ route('POST', /^\/api\/enquiries$/, false, ({ req, res, body }) => {
   run('INSERT INTO enquiries(name,email,room,checkin,checkout,guests,message,via) VALUES(?,?,?,?,?,?,?,?)', str(body.name, 120), str(body.email, 160), str(body.room, 120), str(body.checkin, 10), str(body.checkout, 10), str(body.guests, 10), str(body.message, 1000), str(body.via, 20));
   J(res, 200, { ok: true });
 });
+/* ---------- guest reviews ---------- */
+const revOut = (r) => ({ id: r.id, name: r.name, apartment: r.apartment, rating: r.rating, comment: r.comment, verified: !!r.verified, date: String(r.created_at).slice(0, 10) });
+route('GET', /^\/api\/reviews$/, false, ({ res }) => {
+  const rows = all("SELECT * FROM reviews WHERE status='approved' ORDER BY created_at DESC, id DESC LIMIT 60"), st = get("SELECT COUNT(*) c, AVG(rating) a FROM reviews WHERE status='approved'");
+  J(res, 200, { reviews: rows.map(revOut), count: st.c, average: st.c ? Math.round(st.a * 10) / 10 : 0 });
+});
+route('POST', /^\/api\/reviews$/, false, ({ req, res, body }) => {
+  if (body.website) return J(res, 200, { ok: true });
+  const name = str(body.name, 60), comment = str(body.comment, 1000).trim(), rating = int(body.rating);
+  if (name.trim().length < 2) throw new HttpError(400, 'Please enter your name.');
+  if (rating < 1 || rating > 5) throw new HttpError(400, 'Please choose a star rating.');
+  if (comment.length < 10) throw new HttpError(400, 'Please write at least a short sentence about your stay.');
+  if (!limit('rev|' + ipOf(req), 5, 3600e3)) throw new HttpError(429, 'You have sent several reviews already. Please try again later.');
+  const apt = get('SELECT name FROM apartments WHERE name=?', str(body.apartment, 120)), ref = str(body.ref, 20).trim().toUpperCase();
+  const bk = ref ? get("SELECT 1 FROM bookings WHERE ref=? AND status IN ('checked_in','completed')", ref) : null;
+  run('INSERT INTO reviews(name,apartment,rating,comment,status,verified,source,created_at) VALUES(?,?,?,?,?,?,?,?)', name.trim(), apt ? apt.name : '', rating, comment, 'pending', bk ? 1 : 0, 'guest', nowLagos());
+  J(res, 200, { ok: true });
+});
+route('GET', /^\/api\/admin\/reviews$/, 'admin', ({ res }) => J(res, 200, { reviews: all('SELECT * FROM reviews ORDER BY (status=\'pending\') DESC, created_at DESC, id DESC LIMIT 1000'), apartments: all('SELECT name FROM apartments ORDER BY sort,id').map(a => a.name) }));
+const revFields = (b, cur) => { const name = str(b.name, 60).trim(), comment = str(b.comment, 1000).trim(), rating = int(b.rating);
+  if (!name) throw new HttpError(400, 'Enter the reviewer name.'); if (rating < 1 || rating > 5) throw new HttpError(400, 'Choose a rating from 1 to 5.'); if (!comment) throw new HttpError(400, 'Write the review.');
+  return { name, comment, rating, apartment: str(b.apartment, 120), status: ['pending', 'approved', 'hidden'].includes(b.status) ? b.status : (cur ? cur.status : 'approved') }; };
+route('POST', /^\/api\/admin\/reviews$/, 'admin', ({ res, body }) => {
+  const f = revFields(body), d = isDate(str(body.date, 10)) ? str(body.date, 10) + ' 12:00:00' : nowLagos();
+  run('INSERT INTO reviews(name,apartment,rating,comment,status,verified,source,created_at) VALUES(?,?,?,?,?,?,?,?)', f.name, f.apartment, f.rating, f.comment, 'approved', 0, 'admin', d); audit('review.add', f.name); J(res, 200, { ok: true });
+});
+route('POST', /^\/api\/admin\/reviews\/(\d+)$/, 'admin', ({ res, body, m }) => {
+  const cur = get('SELECT * FROM reviews WHERE id=?', Number(m[1])); if (!cur) throw new HttpError(404, 'Not found');
+  const f = revFields({ ...cur, ...body }, cur); run('UPDATE reviews SET name=?,apartment=?,rating=?,comment=?,status=? WHERE id=?', f.name, f.apartment, f.rating, f.comment, f.status, cur.id); audit('review.update', cur.id + ' ' + f.status); J(res, 200, { ok: true });
+});
+route('POST', /^\/api\/admin\/reviews\/(\d+)\/delete$/, 'admin', ({ res, m }) => { run('DELETE FROM reviews WHERE id=?', Number(m[1])); audit('review.delete', m[1]); J(res, 200, { ok: true }); });
 route('POST', /^\/api\/admin\/login$/, false, ({ req, res, body }) => {
   const key = 'login|' + ipOf(req); if (!limit(key, 8, 900e3)) throw new HttpError(429, 'Too many attempts. Wait 15 minutes and try again.');
   const pw = String(body.password || ''), un = str(body.username, 40).toLowerCase().replace(/\s+/g, ''); let payload;
@@ -194,6 +226,7 @@ route('GET', /^\/api\/admin\/summary$/, true, ({ res, w }) => {
     inHouse: all("SELECT * FROM bookings WHERE checkin<=? AND checkout>? AND status IN ('confirmed','checked_in')", today, today),
     enquiries: c('SELECT COUNT(*) c FROM enquiries'), total: c("SELECT COUNT(*) c FROM bookings WHERE status<>'cancelled'"),
     collected: w.role === 'admin' ? get("SELECT COALESCE(SUM(paid),0) s FROM bookings WHERE status<>'cancelled'").s : null, role: w.role, name: w.name,
+    reviews_pending: w.role === 'admin' ? c("SELECT COUNT(*) c FROM reviews WHERE status='pending'") : 0,
     legacy: w.role === 'admin' ? all('SELECT name,row_count FROM legacy_tables ORDER BY name') : []
   });
 });
