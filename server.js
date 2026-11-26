@@ -342,7 +342,43 @@ route('POST', /^\/api\/admin\/legacy\/import$/, 'admin', async ({ res }) => {
   audit('legacy.import', summary.map(s => s.name + ':' + s.rows).join(' ')); J(res, 200, { tables: summary });
 });
 const pick = (cols, re) => cols.find(c => re.test(c));
-const normDate = (v) => { if (!v) return ''; const d = new Date(v); return isNaN(d) ? '' : d.toISOString().slice(0, 10); };
+const normDate = (v) => { if (!v) return ''; if (/^\d{4}-\d{2}-\d{2}/.test(String(v))) return String(v).slice(0, 10); const d = new Date(v); return isNaN(d) ? '' : d.toISOString().slice(0, 10); };
+/* Old system "Reservation" table: join guests and payments, then make real bookings */
+function convertReservations(t, cols, M, gIdCol, gTab) {
+  const rows = (name) => all('SELECT data FROM legacy_rows WHERE tbl=? ORDER BY id', name).map(r => JSON.parse(r.data));
+  const gCols = JSON.parse(gTab.cols), gid = pick(gCols, /^id$/i), gName = pick(gCols, /^(name|full_?name|guest_?name)$/i), gFirst = pick(gCols, /first_?name/i), gLast = pick(gCols, /(last|sur)_?name/i), gMail = pick(gCols, /e-?mail/i), gTel = pick(gCols, /phone|mobile|tel/i);
+  const guests = {}; for (const g of rows(gTab.name)) guests[String(g[gid])] = { name: gName ? g[gName] : [g[gFirst], g[gLast]].filter(Boolean).join(' '), email: gMail ? g[gMail] : '', phone: gTel ? g[gTel] : '' };
+  const rateCol = pick(cols, /^(rate|rate_?per_?night|price_?per_?night|nightly_?rate|price|rate_?amount)$/i) || pick(cols, /rate|price|night/i), idCol = pick(cols, /^id$/i), srcCol = pick(cols, /^source$/i), guestsCol = pick(cols, /^(guests?|no_?of_?guests|adults|pax)$/i);
+  const apts = all('SELECT name,rate FROM apartments');
+  const pTab = all('SELECT name,cols FROM legacy_tables').find(x => /^payments?$/i.test(x.name)), fTab = all('SELECT name,cols FROM legacy_tables').find(x => /^folios?$/i.test(x.name));
+  let pays = []; if (pTab) { const pc = JSON.parse(pTab.cols), am = pick(pc, /^amount/i) || pick(pc, /amount|paid/i), dt = pick(pc, /created|paid_?at|date|time/i), rv = pick(pc, /reservation_?id|booking_?id/i), fo = pick(pc, /folio_?id/i), me = pick(pc, /method|type/i);
+    pays = rows(pTab.name).map(p => ({ amount: int(p[am]), at: p[dt] ? new Date(p[dt]).getTime() : 0, res: rv ? String(p[rv]) : '', folio: fo ? String(p[fo]) : '', used: false })); }
+  const folioRes = {}; if (fTab) { const fc = JSON.parse(fTab.cols), fi = pick(fc, /^id$/i), fr = pick(fc, /reservation_?id|booking_?id/i); if (fi && fr) for (const f of rows(fTab.name)) folioRes[String(f[fi])] = String(f[fr]); }
+  const statusMap = (s) => { s = String(s || '').toLowerCase(); return /cancel/.test(s) ? 'cancelled' : /complete|checked.?out|done/.test(s) ? 'completed' : /checked.?in/.test(s) ? 'checked_in' : /book|confirm|paid|approved|reserv/.test(s) ? 'confirmed' : 'awaiting_payment'; };
+  let added = 0, skipped = 0, linked = 0;
+  const list = rows(t).map(d => ({ d, ci: normDate(d[M.ci]), co: normDate(d[M.co]) })).filter(x => x.ci && x.co && x.co > x.ci);
+  skipped += rows(t).length - list.length;
+  const rid = (d) => idCol ? String(d[idCol]) : '';
+  for (const x of list) for (const p of pays) if (!p.used && rid(x.d) && (p.res === rid(x.d) || (p.folio && folioRes[p.folio] === rid(x.d)))) { p.res = rid(x.d); }
+  db.exec('BEGIN');
+  try {
+    for (const { d, ci, co } of list) {
+      const ref = 'OLD-' + String(idCol ? d[idCol] : crypto.randomBytes(3).toString('hex')).replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toUpperCase(), g = guests[String(d[gIdCol])] || {};
+      if (get('SELECT 1 FROM bookings WHERE ref=?', ref)) { skipped++; continue; }
+      const nights = daysBetween(ci, co), rate = Math.max(0, int(d[rateCol])), sub = nights * rate, created = d[M.created] && !isNaN(new Date(d[M.created])) ? new Date(d[M.created]).getTime() : 0;
+      let paid = 0, mine = pays.filter(p => !p.used && rid(d) && p.res === rid(d));
+      if (!mine.length) { const cand = pays.filter(p => !p.used && p.amount === sub).sort((a, b) => Math.abs(a.at - created) - Math.abs(b.at - created))[0]; if (cand) mine = [cand]; }
+      for (const p of mine) { p.used = true; paid += p.amount; } if (mine.length) linked++;
+      const apt = apts.find(a => a.rate === rate), source = srcCol ? String(d[srcCol] || '').toLowerCase() : '';
+      run('INSERT INTO bookings(ref,created_at,name,email,phone,room,checkin,checkout,guests,nights,rate,subtotal,caution,deposit,paid,status,message,notes,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        ref, created ? new Date(created).toISOString().slice(0, 19).replace('T', ' ') : new Date().toISOString().slice(0, 19).replace('T', ' '), str(g.name || 'Guest', 120), str(g.email, 160), str(g.phone, 40), apt ? apt.name : '', ci, co,
+        guestsCol ? Math.max(1, int(d[guestsCol], 1)) : 1, nights, rate, sub, 0, 0, paid, statusMap(d[M.status]), '', 'Old system: ' + String(d[M.status] || '') + (source ? '; ' + (source === 'online' ? 'booked online' : 'entered by staff') : ''), 'old system');
+      added++;
+    }
+    db.exec('COMMIT');
+  } catch (e) { try { db.exec('ROLLBACK'); } catch {} throw new HttpError(500, 'Conversion stopped: ' + String(e.message).slice(0, 160)); }
+  audit('legacy.convert', `${t}: ${added} added, ${skipped} skipped (reservations + guests + payments)`); return { added, skipped, linked, mapping: { joined: 'reservations + guests + payments' } };
+}
 route('POST', /^\/api\/admin\/legacy\/convert$/, 'admin', ({ res, body }) => {
   const t = str(body.table, 80), info = get('SELECT cols FROM legacy_tables WHERE name=?', t); if (!info) throw new HttpError(404, 'Choose an imported table.');
   const cols = JSON.parse(info.cols), M = {
@@ -350,6 +386,8 @@ route('POST', /^\/api\/admin\/legacy\/convert$/, 'admin', ({ res, body }) => {
     room: pick(cols, /^(room|apartment|suite|unit|room_?type|room_?name|apartment_?name)$/i) || pick(cols, /room|apartment|suite/i), ci: pick(cols, /check_?-?in|arrival|start_?date|from_?date/i), co: pick(cols, /check_?-?out|departure|end_?date|to_?date/i),
     guests: pick(cols, /^(guests?|no_?of_?guests|num(ber)?_?(of_?)?guests|adults|persons|pax|occupants)$/i), total: pick(cols, /total|amount|price|cost/i), paid: pick(cols, /^(paid|amount_?paid|deposit)/i), status: pick(cols, /status/i), created: pick(cols, /created|booked|date_?added/i), id: pick(cols, /^(id|booking_?id|reference|ref)$/i)
   };
+  const gTab = all('SELECT name,cols FROM legacy_tables').find(x => /^guests?$/i.test(x.name)), gIdCol = pick(cols, /^guest_?id$/i);
+  if (!M.name && M.ci && M.co && gIdCol && gTab) return J(res, 200, convertReservations(t, cols, M, gIdCol, gTab));
   if (!M.name || !M.ci || !M.co) throw new HttpError(400, 'This table does not look like bookings (no guest name or dates found). Pick the bookings table.');
   let added = 0, skipped = 0;
   const statusMap = (s) => { s = String(s || '').toLowerCase(); return /cancel/.test(s) ? 'cancelled' : /complete|checked.?out|done/.test(s) ? 'completed' : /checked.?in/.test(s) ? 'checked_in' : /confirm|paid|approved/.test(s) ? 'confirmed' : 'awaiting_payment'; };
@@ -402,7 +440,7 @@ route('POST', /^\/api\/admin\/bookings\/(\d+)\/payments$/, true, ({ res, body, m
   const id = Number(m[1]), b = get('SELECT * FROM bookings WHERE id=?', id); if (!b) throw new HttpError(404, 'Not found');
   const amount = int(body.amount); if (amount <= 0 || amount > 2e9) throw new HttpError(400, 'Enter the amount received.');
   run('INSERT INTO payments(booking_id,amount,method,note,by_name,by_user,created_at) VALUES(?,?,?,?,?,?,?)', id, amount, METHODS.includes(body.method) ? body.method : 'Transfer', str(body.note, 200), w.name, w.username || 'admin', nowLagos());
-  const paid = b.paid + amount, status = b.status === 'awaiting_payment' && paid >= Math.max(1, Math.min(b.deposit || 1, b.subtotal || 1)) ? 'confirmed' : b.status;
+  const paid = b.paid + amount, need = Math.max(1, (b.deposit || 0) + (b.caution || 0)), status = b.status === 'awaiting_payment' && paid >= need ? 'confirmed' : b.status;
   run('UPDATE bookings SET paid=?,status=? WHERE id=?', paid, status, id); audit('payment.add', b.ref + ' ' + amount + ' by ' + w.name);
   J(res, 200, payInfo(id, w));
 });
